@@ -1,0 +1,2146 @@
+######################################################################################################################################################################################################
+# A script to perform pre-processing of task-based SEEG data
+#
+# Inputs:
+#   - Text file containing list of EDF files to process (e.g. SEEG-SK-53_day1\nSEEG-SK-53_day2, etc.)
+#   - Directory containing raw EDF files
+#   - Directory to save processed data
+#   - Directory containing metadata (e.g. trigger definitions)
+#
+# Karim Mithani
+# v1.0.0: 2023-07-15
+# v2.0.0: 2023-11-07: Cleaned up code, added comments, added functionality to generate graphs, added functionality to save data
+# v2.1.0: 2023-11-17: Added reaction time calculations for GnG
+# v2.2.0: ????-??-??: Added CLES and OLES calculations for GnG
+# v2.2.1: 2024-01-17: Added capability for identifying stimulation trials in GoNogo_pySTIMCL and GoNogo_pySTIMOL tasks
+# v3.0.0: 2024-01-23: New method of calculating GoNogo Triggers
+######################################################################################################################################################################################################
+
+### Import libraries:
+
+# General:
+import os
+import numpy as np
+import h5py
+import pickle
+from scipy.signal import welch, morlet, convolve, coherence
+from tqdm import tqdm
+
+# Stats:
+from scipy import stats
+from scipy.integrate import simpson
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, confusion_matrix, average_precision_score, roc_curve, auc
+from sklearn.linear_model import LogisticRegression
+
+# Plotting
+import matplotlib
+import matplotlib.pyplot as plt
+from matplotlib.colors import LogNorm
+from mpl_toolkits.axes_grid1.axes_divider import make_axes_locatable
+import seaborn as sns
+matplotlib.use('Agg')
+
+# Useful functions
+from datafuncs import *
+import time
+import gc
+from enum import IntFlag
+from math import sqrt, floor, ceil
+import mne
+import nibabel as nib
+from typing import Tuple, List, Dict, Union
+
+
+# User-defined variables:
+rawdata_dir = '/d/gmi/1/karimmithani/seeg/rawdata' # Data where raw EDFs are stored
+subjects_file = '/d/gmi/1/karimmithani/seeg/metadata/subject_ids.txt' # Line-separated list of EDF files to process in format SUBJID_x.EDF, where 'x' can be timepoint (e.g. SEEG-SK-53_day1\nSEEG-SK-53_day2, etc.) or task (e.g. SEEG-SK-53_iSpy\nSEEG-SK-53_GoNogo, etc.), both, etc.
+processed_dir = '/d/gmi/1/karimmithani/seeg/processed' # Where processed data will be stored
+metadata_dir = '/d/gmi/1/karimmithani/seeg/metadata' # Should contain: Trigger definition (JSON files)
+trigtype = '_int' # Either '_int' or ''
+montage = 'bipolar' # Either 'bipolar' or 'referential'
+start_epoch = 0 # Start-point of area of interest (code creates a 4-second epoch symmetrically around event; specify between 0 and 4)
+stop_epoch = 4.0 # End-point of area of interest (code creates a 4-second epoch symmetrically around event; specify between 'start_epoch' and  4)
+vs_channel_labels = {'SEEG-SK-55': 'STR1-STR2',
+                     'SEEG-SK-62': 'VS1-VS2',
+                     'SEEG-SK-63': 'VS1-VS2'} # Dictionary of subject IDs and corresponding VS channel labels
+
+# Debugging configuration variables:
+metadata_config = 'n' #input('Do you want to run the metadata generator? (y/n):')
+generate_graphs = 'y' # Whether or not to generate graphs; indicate 'n' for no
+save_data = 'y' # Whether or not to save data; indicate 'n' for no
+gng_individual_multitaper = 'n' # Whether or not to calculate individual multitaper spectra for Go and Nogo trials (COMPUTATIONALLY EXPENSIVE)
+
+######################################################################################################################################################################################################
+# Helper functions:
+######################################################################################################################################################################################################
+
+# Revised calculation of triggers:
+
+def calcTrigsRevised(raw_data, trigs, task):
+    class PortCodes(IntFlag):
+        reset = 0
+        p1 = 1
+        p2 = 2
+        fixation = 4  # fixation cross (ISI)
+        vigilance = 8  # if trial is a vigilance trial
+        btn = 16  # button press
+        go = 32  # go trial
+        nogo = 64  # nogo trial
+        inhibition = 128  # if trial is an inhibition trial
+        all = 255
+    
+    trigs = trigs_orig.copy()
+    trigs['label'] = [(PortCodes(int(x))).name for x in trigs['val'].values]
+    for rowidx, row in trigs.iterrows(): # Label condition as inhibition or vigilance
+        if ('go' in row['label']) and ('nogo' not in row['label']) and ('|' in row['label']):
+            trigs.loc[rowidx, 'condition'] = [x for x in row['label'].split('|') if x != 'go'][0]
+            trigs.loc[rowidx, 'label'] = 'go'
+        elif ('nogo' in row['label']) and ('|' in row['label']):
+            trigs.loc[rowidx, 'condition'] = [x for x in row['label'].split('|') if x != 'nogo'][0]
+            trigs.loc[rowidx, 'label'] = 'nogo'
+    trigs['condition'] = trigs['condition'].fillna(method='ffill')
+    
+    trial_number = 1
+    for rowidx, row in trigs.iterrows(): # Identify trial number
+        if ('go' in row['label']) or ('nogo' in row['label']):
+            trigs.loc[rowidx, 'trial_number'] = trial_number
+            trial_number += 1
+            
+
+    return None
+    
+
+# Function to take triggers file and tasks as inputs, and outputs a dataframe of relevant time indices, times, array of events (for MNE), and event dictionary (for MNE)
+def calcTrigs(raw_data, trigs, task):
+    triggers, times = trigs['val'].values, trigs['idx'].values
+    if task == 'GoNogo_py':
+        trimmed = False
+        num_trigs = 6
+        go_start_tidxs = []
+        go_end_tidxs = []
+        nogo_start_tidxs = []
+        nogo_end_tidxs = []
+        go_correct_tidxs = []
+        go_incorrect_tidxs = []
+        nogo_correct_tidxs = []
+        nogo_incorrect_tidxs = []
+        
+        class PortCodes(IntFlag):
+            reset = 0
+            p1 = 1
+            p2 = 2
+            fixation = 4  # fixation cross (ISI)
+            vigilance = 8  # if trial is a vigilance trial
+            btn = 16  # button press
+            go = 32  # go trial
+            nogo = 64  # nogo trial
+            inhibition = 128  # if trial is an inhibition trial
+            all = 255
+        
+        triple_255 = False
+        
+        if trimmed == False:
+            for trigidx, trig in enumerate(triggers): # Identify startpoint and trim upto that
+                # Startpoint is marked by three 255s in a row, followed by a non-255 value:
+                if trig == 255 and triggers[trigidx + 1] == 255 and triggers[trigidx + 2] == 255 and triggers[trigidx + 3] != 255:
+                    print('\nStarting GoNogo_py task at:\n','Index: ' + str(trigidx + 3) + '\n', 'Timepoint: ' + str(times[trigidx + 3]) + '\n', 'Trigger value: ' + str(triggers[trigidx + 3]))
+                    # Trim triggers and times to startpoint:
+                    triggers = np.delete(triggers, range(trigidx))
+                    times = np.delete(times, range(trigidx))
+                    triple_255 = True
+            trimmed = True
+        
+        if triple_255 == False: # Simeon changed the way he marks the start of the task at one point, so we need to account for that:
+            print() # PLACEHOLDER
+        
+        # Loop through trimmed triggers and build lists of triggers/timepoints based on event of interest
+        # Events of interset include: Go Start, Go End, Nogo Start, Nogo End, Go Correct, Go Incorrect, Nogo Correct, Nogo Incorrect
+        # The following loop will generate a separate list of triggers/timepoints for each event of interest:
+        for i, trig in enumerate(triggers):
+            if trig != 255:
+                flags = list(PortCodes(int(trig))) # Convert trigger to binary flags
+                for l in flags: # Loop through binary flags
+                    if int(l) == 32: # 32 = Go
+                        go_start_tidx = times[i] # Identify startpoint of Go trial
+                        go_start_tidxs.append(go_start_tidx) # Append startpoint to list of Go startpoints
+                        stop = False
+                        for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+                            flags2 = list(PortCodes(int(trig2)))
+                            for m in flags2:
+                                if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+                                    go_end_tidx = times[i+1:][j]
+                                    go_end_tidxs.append(go_end_tidx)
+                                    stop = True
+                                    break
+                                elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+                                    go_end_tidx = times[i+1:][j]
+                                    go_end_tidxs.append(go_end_tidx)
+                                    stop = True
+                                    break
+                            if stop == True: # If next trial has been found, break out of loop
+                                break
+                    elif int(l) == 64: # 64 = Nogo
+                        nogo_start_tidx = times[i] # Identify startpoint of Nogo trial
+                        nogo_start_tidxs.append(nogo_start_tidx) # Append startpoint to list of Nogo startpoints
+                        stop = False
+                        for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+                            flags2 = list(PortCodes(int(trig2))) # Convert trigger to binary flags
+                            for m in flags2: # Loop through binary flags
+                                if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+                                    nogo_end_tidx = times[i+1:][j]
+                                    nogo_end_tidxs.append(nogo_end_tidx)
+                                    stop = True
+                                    break
+                                elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+                                    nogo_end_tidx = times[i+1:][j]
+                                    nogo_end_tidxs.append(nogo_end_tidx)
+                                    stop = True
+                                    break
+                            if stop == True: # If next trial has been found, break out of loop
+                                break
+        
+        # Now let's loop through the start/end timepoints of Go trials and identify correct/incorrect trials:
+        for z, (a, b) in enumerate(zip(go_start_tidxs, go_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 16 not in tmpvals: # 16 = Button press; if there is no button press, then it's an incorrect Go trial
+                for n, l in enumerate(tmpvals):
+                    if l == 4:
+                        go_incorrect_tidx = tmpidxs[n]
+                        go_incorrect_tidxs.append(go_incorrect_tidx)
+                        break
+                    else:
+                        continue
+                    break
+            else:
+                for n, l in enumerate(tmpvals):
+                    flags = list(PortCodes(int(l)))
+                    for m in flags:
+                        if int(m) == 16: # 16 = Button press, which is correct in Go trials
+                            go_correct_tidx = tmpidxs[n]
+                            go_correct_tidxs.append(go_correct_tidx)
+                            break
+                        else:
+                            continue
+                        break
+        # And then do the same for NoGo trials:
+        for z, (a, b) in enumerate(zip(nogo_start_tidxs, nogo_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 16 in tmpvals: # 16 = Button press, which is incorrect in Nogo trials
+                for l, m in enumerate(tmpvals):
+                    flags = list(PortCodes(int(m)))
+                    for n in flags:
+                        if int(n) == 16: 
+                            nogo_incorrect_tidx = tmpidxs[l]
+                            nogo_incorrect_tidxs.append(nogo_incorrect_tidx)
+                        else:
+                            continue
+                        break
+            else: # If there is no button press, then it's a correct Nogo trial
+                for l, m in enumerate(tmpvals):
+                    flags = list(PortCodes(m))
+                    for n in flags:
+                        if int(n) == 4: # We mark the time index of the fixation cross as the timepoint of NoGo Correct
+                            nogo_correct_tidx = tmpidxs[l]
+                            nogo_correct_tidxs.append(nogo_correct_tidx)
+                            break
+                        else:
+                            continue
+                        break
+        
+        # If correct + incorrect trials don't add up to total trials, then raise an error
+        if len(go_correct_tidxs) + len(go_incorrect_tidxs) != len(go_start_tidxs):
+            raise ValueError('@@@ Go correct + incorrect trials do not add up to total trials! @@@')
+        if len(nogo_correct_tidxs) + len(nogo_incorrect_tidxs) != len(nogo_start_tidxs):
+            raise ValueError('@@@ Nogo correct + incorrect trials do not add up to total trials! @@@')
+        
+        # Compile time indices and times:
+        idx_df_dict = dict({'go_start_tidxs':go_start_tidxs, 'go_end_tidxs':go_end_tidxs,
+                               'go_correct_tidxs':go_correct_tidxs, 'go_incorrect_tidxs':go_incorrect_tidxs,
+                               'nogo_start_tidxs':nogo_start_tidxs, 'nogo_end_tidxs':nogo_end_tidxs,
+                               'nogo_correct_tidxs':nogo_correct_tidxs, 'nogo_incorrect_tidxs':nogo_incorrect_tidxs})
+        idx_df = pd.DataFrame.from_dict(idx_df_dict, orient='index').transpose()
+        go_start_times = raw_data.times[go_start_tidxs]
+        go_correct_times = raw_data.times[go_correct_tidxs]
+        go_incorrect_times = raw_data.times[go_incorrect_tidxs]
+        go_end_times = raw_data.times[go_end_tidxs]
+        nogo_start_times = raw_data.times[nogo_start_tidxs]
+        nogo_correct_times = raw_data.times[nogo_correct_tidxs]
+        nogo_incorrect_times = raw_data.times[nogo_incorrect_tidxs]
+        nogo_end_times = raw_data.times[nogo_end_tidxs]
+        times_df_dict = dict({'go_start_times':go_start_times, 'go_correct_times':go_correct_times, 'go_incorrect_times':go_incorrect_times, 'go_end_times':go_end_times, 'nogo_start_times':nogo_start_times, 'nogo_correct_times':nogo_correct_times, 'nogo_incorrect_times':nogo_incorrect_times, 'nogo_end_times':nogo_end_times})
+        times_df = pd.DataFrame.from_dict(times_df_dict, orient='index')
+        times_df = times_df.transpose()
+        
+        # Generate event array in MNE-compatible format:
+        if len(go_start_tidxs) > len(nogo_start_tidxs):
+            event_array = np.zeros((len(go_start_tidxs)*num_trigs,3))
+        else:
+            event_array = np.zeros((len(nogo_start_tidxs)*num_trigs,3))
+        n = 0
+        for ii in [go_start_tidxs, go_correct_tidxs, go_incorrect_tidxs, go_end_tidxs, nogo_start_tidxs, nogo_correct_tidxs, nogo_incorrect_tidxs, nogo_end_tidxs]:
+            for jj in ii:
+                if ii == go_start_tidxs:
+                    event_array[n] = [jj, 0, 8]
+                elif ii == nogo_start_tidxs:
+                    event_array[n] = [jj, 0, 16]
+                elif ii == go_correct_tidxs:
+                    event_array[n] = [jj, 0, 2]
+                elif ii == nogo_correct_tidxs:
+                    event_array[n] = [jj, 0, 92]
+                elif ii == go_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 1]
+                elif ii == nogo_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 91]
+                elif ii == go_end_tidxs:
+                    event_array[n] = [jj, 0, 99]
+                elif ii == nogo_end_tidxs:
+                    event_array[n] = [jj, 0, 999]
+                n+=1
+        event_array=event_array[~np.all(event_array==0,axis=1)]
+        
+        # Generate event dictionary in MNE-compatible format:
+        event_dict = {
+            'Go Start': 8,
+            'Go Correct': 2,
+            'Go Incorrect': 1,
+            'Go End': 99,
+            'Nogo Start': 16,
+            'Nogo Correct': 92,
+            'Nogo Incorrect': 91,
+            'Nogo End': 999
+        }
+        return idx_df, times_df, event_dict, event_array
+        
+        # ADD FUNCTIONALITY TO ACCOUNT FOR VIGILANCE VS. INHIBITION TRIALS
+        
+        print()   # PLACEHOLDER
+    elif task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL': # Closed-loop stimulation
+        trimmed = False
+        num_trigs = 6
+        go_start_tidxs = []
+        go_end_tidxs = []
+        nogo_start_tidxs = []
+        nogo_end_tidxs = []
+        go_correct_tidxs = []
+        go_incorrect_tidxs = []
+        nogo_correct_tidxs = []
+        nogo_incorrect_tidxs = []
+        
+        class PortCodes(IntFlag):
+            reset = 0
+            intent = 1
+            p2 = 2
+            fixation = 4  # fixation cross (ISI)
+            vigilance = 8  # if trial is a vigilance trial
+            btn = 16  # button press
+            go = 32  # go trial
+            nogo = 64  # nogo trial
+            inhibition = 128  # if trial is an inhibition trial
+            all = 255
+        
+        triple_255 = False
+        
+        if trimmed == False:
+            for trigidx, trig in enumerate(triggers): # Identify startpoint and trim upto that
+                # Startpoint is marked by three 255s in a row, followed by a non-255 value:
+                if trig == 255 and triggers[trigidx + 1] == 255 and triggers[trigidx + 2] == 255 and triggers[trigidx + 3] != 255:
+                    print('\nStarting GoNogo_py task at:\n','Index: ' + str(trigidx + 3) + '\n', 'Timepoint: ' + str(times[trigidx + 3]) + '\n', 'Trigger value: ' + str(triggers[trigidx + 3]))
+                    # Trim triggers and times to startpoint:
+                    triggers = np.delete(triggers, range(trigidx))
+                    times = np.delete(times, range(trigidx))
+                    triple_255 = True
+                    trimmed = True
+        
+        if triple_255 == False: # Simeon changed the way he marks the start of the task at one point, so we need to account for that:
+            print() # PLACEHOLDER
+        
+        # Loop through trimmed triggers and build lists of triggers/timepoints based on event of interest
+        # Events of interset include: Go Start, Go End, Nogo Start, Nogo End, Go Correct, Go Incorrect, Nogo Correct, Nogo Incorrect
+        # The following loop will generate a separate list of triggers/timepoints for each event of interest:
+        for i, trig in enumerate(triggers):
+            if trig != 255:
+                flags = list(PortCodes(int(trig))) # Convert trigger to binary flags
+                for l in flags: # Loop through binary flags
+                    if int(l) == 32: # 32 = Go
+                        go_start_tidx = times[i] # Identify startpoint of Go trial
+                        go_start_tidxs.append(go_start_tidx) # Append startpoint to list of Go startpoints
+                        stop = False
+                        for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+                            if trig2 != 255:
+                                flags2 = list(PortCodes(int(trig2)))
+                                for m in flags2:
+                                    if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+                                        go_end_tidx = times[i+1:][j]
+                                        go_end_tidxs.append(go_end_tidx)
+                                        stop = True
+                                        break
+                                    elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+                                        go_end_tidx = times[i+1:][j]
+                                        go_end_tidxs.append(go_end_tidx)
+                                        stop = True
+                                        break
+                                if stop == True: # If next trial has been found, break out of loop
+                                    break
+                    elif int(l) == 64: # 64 = Nogo
+                        nogo_start_tidx = times[i] # Identify startpoint of Nogo trial
+                        nogo_start_tidxs.append(nogo_start_tidx) # Append startpoint to list of Nogo startpoints
+                        stop = False
+                        for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+                            if trig2 != 255:
+                                flags2 = list(PortCodes(int(trig2))) # Convert trigger to binary flags
+                                for m in flags2: # Loop through binary flags
+                                    if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+                                        nogo_end_tidx = times[i+1:][j]
+                                        nogo_end_tidxs.append(nogo_end_tidx)
+                                        stop = True
+                                        break
+                                    elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+                                        nogo_end_tidx = times[i+1:][j]
+                                        nogo_end_tidxs.append(nogo_end_tidx)
+                                        stop = True
+                                        break
+                                if stop == True: # If next trial has been found, break out of loop
+                                    break
+        
+        # Now let's loop through the start/end timepoints of Go trials and identify correct/incorrect trials:
+        for z, (a, b) in enumerate(zip(go_start_tidxs, go_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 16 not in tmpvals: # 16 = Button press; if there is no button press, then it's an incorrect Go trial
+                for n, l in enumerate(tmpvals):
+                    if l == 4:
+                        go_incorrect_tidx = tmpidxs[n]
+                        go_incorrect_tidxs.append(go_incorrect_tidx)
+                        break
+                    else:
+                        continue
+                    break
+            else:
+                button_pressed = False
+                for n, l in enumerate(tmpvals):
+                    if l != 255 and button_pressed == False:
+                        flags = list(PortCodes(int(l)))
+                        for m in flags:
+                            if int(m) == 16: # 16 = Button press, which is correct in Go trials
+                                go_correct_tidx = tmpidxs[n]
+                                go_correct_tidxs.append(go_correct_tidx)
+                                button_pressed = True
+                                break
+                            else:
+                                continue
+                            break
+        # And then do the same for NoGo trials:
+        for z, (a, b) in enumerate(zip(nogo_start_tidxs, nogo_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 16 in tmpvals: # 16 = Button press, which is incorrect in Nogo trials
+                for l, m in enumerate(tmpvals):
+                    if m != 255:
+                        flags = list(PortCodes(int(m)))
+                        for n in flags:
+                            if int(n) == 16: 
+                                nogo_incorrect_tidx = tmpidxs[l]
+                                nogo_incorrect_tidxs.append(nogo_incorrect_tidx)
+                            else:
+                                continue
+                            break
+            else: # If there is no button press, then it's a correct Nogo trial
+                for l, m in enumerate(tmpvals):
+                    if m != 255:
+                        flags = list(PortCodes(m))
+                        for n in flags:
+                            if int(n) == 4: # We mark the time index of the fixation cross as the timepoint of NoGo Correct
+                                nogo_correct_tidx = tmpidxs[l]
+                                nogo_correct_tidxs.append(nogo_correct_tidx)
+                                break
+                            else:
+                                continue
+                            break
+        
+        # If correct + incorrect trials don't add up to total trials, then raise an error
+        if len(go_correct_tidxs) + len(go_incorrect_tidxs) != len(go_start_tidxs):
+            raise ValueError('@@@ Go correct + incorrect trials do not add up to total trials! @@@')
+        if len(nogo_correct_tidxs) + len(nogo_incorrect_tidxs) != len(nogo_start_tidxs):
+            raise ValueError('@@@ Nogo correct + incorrect trials do not add up to total trials! @@@')
+                    
+        # Compile time indices and times:
+        idx_df_dict = dict({'go_start_tidxs':go_start_tidxs, 'go_end_tidxs':go_end_tidxs,
+                               'go_correct_tidxs':go_correct_tidxs, 'go_incorrect_tidxs':go_incorrect_tidxs,
+                               'nogo_start_tidxs':nogo_start_tidxs, 'nogo_end_tidxs':nogo_end_tidxs,
+                               'nogo_correct_tidxs':nogo_correct_tidxs, 'nogo_incorrect_tidxs':nogo_incorrect_tidxs})
+        idx_df = pd.DataFrame.from_dict(idx_df_dict, orient='index')
+        idx_df = idx_df.transpose()
+        go_start_times = raw_data.times[go_start_tidxs]
+        go_correct_times = raw_data.times[go_correct_tidxs]
+        go_incorrect_times = raw_data.times[go_incorrect_tidxs]
+        go_end_times = raw_data.times[go_end_tidxs]
+        nogo_start_times = raw_data.times[nogo_start_tidxs]
+        nogo_correct_times = raw_data.times[nogo_correct_tidxs]
+        nogo_incorrect_times = raw_data.times[nogo_incorrect_tidxs]
+        nogo_end_times = raw_data.times[nogo_end_tidxs]
+        times_df_dict = dict({'go_start_times':go_start_times, 'go_correct_times':go_correct_times, 'go_incorrect_times':go_incorrect_times, 'go_end_times':go_end_times, 'nogo_start_times':nogo_start_times, 'nogo_correct_times':nogo_correct_times, 'nogo_incorrect_times':nogo_incorrect_times, 'nogo_end_times':nogo_end_times})
+        times_df = pd.DataFrame.from_dict(times_df_dict, orient='index')
+        times_df = times_df.transpose()
+        
+        # Generate event array in MNE-compatible format:
+        if len(go_start_tidxs) > len(nogo_start_tidxs):
+            event_array = np.zeros((len(go_start_tidxs)*num_trigs,3))
+        else:
+            event_array = np.zeros((len(nogo_start_tidxs)*num_trigs,3))
+        # arrayshape = sum([len(x) for x in [go_start_tidxs, go_correct_tidxs, go_incorrect_tidxs, go_end_tidxs, nogo_start_tidxs, nogo_correct_tidxs, nogo_incorrect_tidxs, nogo_end_tidxs]])
+        # event_array = np.zeros((arrayshape,3))
+        n = 0
+        for ii in [go_start_tidxs, go_correct_tidxs, go_incorrect_tidxs, go_end_tidxs, nogo_start_tidxs, nogo_correct_tidxs, nogo_incorrect_tidxs, nogo_end_tidxs]:
+            for jj in ii:
+                if ii == go_start_tidxs:
+                    event_array[n] = [jj, 0, 8]
+                elif ii == nogo_start_tidxs:
+                    event_array[n] = [jj, 0, 16]
+                elif ii == go_correct_tidxs:
+                    event_array[n] = [jj, 0, 2]
+                elif ii == nogo_correct_tidxs:
+                    event_array[n] = [jj, 0, 92]
+                elif ii == go_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 1]
+                elif ii == nogo_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 91]
+                elif ii == go_end_tidxs:
+                    event_array[n] = [jj, 0, 99]
+                elif ii == nogo_end_tidxs:
+                    event_array[n] = [jj, 0, 999]
+                n+=1
+        event_array=event_array[~np.all(event_array==0,axis=1)]
+        
+        # Generate event dictionary in MNE-compatible format:
+        event_dict = {
+            'Go Start': 8,
+            'Go Correct': 2,
+            'Go Incorrect': 1,
+            'Go End': 99,
+            'Nogo Start': 16,
+            'Nogo Correct': 92,
+            'Nogo Incorrect': 91,
+            'Nogo End': 999
+        }
+        return idx_df, times_df, event_dict, event_array
+    
+    
+    elif task == 'GoNogo':
+        trial_number = 0
+        num_trigs = 5
+        go_start_tidxs = []
+        go_end_tidxs = []
+        nogo_start_tidxs = []
+        nogo_end_tidxs = []
+        go_correct_tidxs = []
+        go_incorrect_tidxs = []
+        nogo_correct_tidxs = []
+        nogo_incorrect_tidxs = []
+        
+        # ADD FUNCTIONALITY FOR DETECTING START OF TASK HERE
+        
+        for i, trig in enumerate(triggers):
+            if trig == 8:
+                go_start_tidx = times[i]
+                go_start_tidxs.append(go_start_tidx)
+                for j, trig2 in enumerate(triggers[i+1:]):
+                    if trig2 == 8 or trig2 == 16:
+                        go_end_tidx = times[i+1:][j]
+                        go_end_tidxs.append(go_end_tidx)
+                        break
+                    elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+                        go_end_tidx = times[i+1:][j]
+                        go_end_tidxs.append(go_end_tidx)
+                        break
+            if trig == 16:
+                nogo_start_tidx = times[i]
+                nogo_start_tidxs.append(nogo_start_tidx)
+                for j, trig2 in enumerate(triggers[i+1:]):
+                    if trig2 == 8 or trig2 == 16:
+                        nogo_end_tidx = times[i+1:][j]
+                        nogo_end_tidxs.append(nogo_end_tidx)
+                        break
+                    elif times[i+1:][j] == times[-1]: # In case last trial is "Nogo"
+                        nogo_end_tidx = times[i+1:][j]
+                        nogo_end_tidxs.append(nogo_end_tidx)
+                        break
+            
+        for z, (a, b) in enumerate(zip(go_start_tidxs, go_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 1 not in tmpvals and 2 not in tmpvals:
+                for l, m in enumerate(tmpvals):
+                    if m==4:
+                        go_incorrect_tidx = tmpidxs[l]
+                        go_incorrect_tidxs.append(go_incorrect_tidx)
+                        break
+            else:
+                for l, m in enumerate(tmpvals):
+                    if m==1:
+                        go_incorrect_tidx = tmpidxs[l]
+                        go_incorrect_tidxs.append(go_incorrect_tidx)
+                        break
+                    elif m==2:
+                        go_correct_tidx = tmpidxs[l]
+                        go_correct_tidxs.append(go_correct_tidx)
+                        break
+        for z, (a, b) in enumerate(zip(nogo_start_tidxs, nogo_end_tidxs)):
+            tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+            tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+            if 1 in tmpvals:
+                for l, m in enumerate(tmpvals):
+                    if m==1:
+                        nogo_incorrect_tidx = tmpidxs[l]
+                        nogo_incorrect_tidxs.append(nogo_incorrect_tidx)
+                        break
+            else:
+                for l, m in enumerate(tmpvals):
+                    if m==4:
+                        nogo_correct_tidx = tmpidxs[l]
+                        nogo_correct_tidxs.append(nogo_correct_tidx)
+                        break
+        
+        # Compile time indices and times:
+        idx_df_dict = dict({'go_start_tidxs':go_start_tidxs, 'go_end_tidxs':go_end_tidxs,
+                               'go_correct_tidxs':go_correct_tidxs, 'go_incorrect_tidxs':go_incorrect_tidxs,
+                               'nogo_start_tidxs':nogo_start_tidxs, 'nogo_end_tidxs':nogo_end_tidxs,
+                               'nogo_correct_tidxs':nogo_correct_tidxs, 'nogo_incorrect_tidxs':nogo_incorrect_tidxs})
+        idx_df = pd.DataFrame.from_dict(idx_df_dict, orient='index')
+        idx_df = idx_df.transpose()
+        go_start_times = raw_data.times[go_start_tidxs]
+        go_correct_times = raw_data.times[go_correct_tidxs]
+        go_incorrect_times = raw_data.times[go_incorrect_tidxs]
+        go_end_times = raw_data.times[go_end_tidxs]
+        nogo_start_times = raw_data.times[nogo_start_tidxs]
+        nogo_correct_times = raw_data.times[nogo_correct_tidxs]
+        nogo_incorrect_times = raw_data.times[nogo_incorrect_tidxs]
+        nogo_end_times = raw_data.times[nogo_end_tidxs]
+        times_df_dict = dict({'go_start_times':go_start_times, 'go_correct_times':go_correct_times, 'go_incorrect_times':go_incorrect_times, 'go_end_times':go_end_times, 'nogo_start_times':nogo_start_times, 'nogo_correct_times':nogo_correct_times, 'nogo_incorrect_times':nogo_incorrect_times, 'nogo_end_times':nogo_end_times})
+        times_df = pd.DataFrame.from_dict(times_df_dict, orient='index')
+        times_df = times_df.transpose()
+        
+        # Generate event array in MNE-compatible format:
+        if len(go_start_tidxs) > len(nogo_start_tidxs):
+            event_array = np.zeros((len(go_start_tidxs)*num_trigs,3))
+        else:
+            event_array = np.zeros((len(nogo_start_tidxs)*num_trigs,3))
+        n = 0
+        for ii in [go_start_tidxs, go_correct_tidxs, go_incorrect_tidxs, go_end_tidxs, nogo_start_tidxs, nogo_correct_tidxs, nogo_incorrect_tidxs, nogo_end_tidxs]:
+            for jj in ii:
+                if ii == go_start_tidxs:
+                    event_array[n] = [jj, 0, 8]
+                elif ii == nogo_start_tidxs:
+                    event_array[n] = [jj, 0, 16]
+                elif ii == go_correct_tidxs:
+                    event_array[n] = [jj, 0, 2]
+                elif ii == nogo_correct_tidxs:
+                    event_array[n] = [jj, 0, 92]
+                elif ii == go_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 1]
+                elif ii == nogo_incorrect_tidxs:
+                    event_array[n] = [jj, 0, 91]
+                elif ii == go_end_tidxs:
+                    event_array[n] = [jj, 0, 99]
+                elif ii == nogo_end_tidxs:
+                    event_array[n] = [jj, 0, 999]
+                n+=1
+        event_array=event_array[~np.all(event_array==0,axis=1)]
+        
+        # Generate event dictionary in MNE-compatible format:
+        event_dict = {
+            'Go Start': 8,
+            'Go Correct': 2,
+            'Go Incorrect': 1,
+            'Go End': 99,
+            'Nogo Start': 16,
+            'Nogo Correct': 92,
+            'Nogo Incorrect': 91,
+            'Nogo End': 999
+        }
+        return idx_df, times_df, event_dict, event_array
+
+    
+    elif task == 'iSpy':
+        trial_number = 0
+        num_trigs = 3
+        start_tidxs = []
+        correct_tidxs = []
+        end_tidxs = []
+        triggers_trimmed = []
+        for i, trig in enumerate(triggers):
+            
+            # Find task start point and trim arrays:
+            if trig == 255 and triggers[i+1] == 255 and triggers[i+2] == 255 and triggers[i+3] != 255:
+                triggers_trimmed = np.delete(triggers, range(i))
+                times_trimmed = np.delete(times, range(i))
+                print('\nStarting iSpy task at:\n','Index: ' + str(i) + '\n', 'Timepoint: ' + str(times[i]) + '\n', 'Trigger value: ' + str(trig))
+            
+            # In some trials there is no start point (i.e. three 255s in a row), so we can keep all triggers as triggers_trimmed:
+            if triggers_trimmed == []: # If triggers_trimmed remains empty after the above step
+                triggers_trimmed = triggers
+                times_trimmed = times
+            
+        for j, trig2 in enumerate(triggers_trimmed):
+            if trig2 == 16:
+                start_tidx = times_trimmed[j]
+                start_tidxs.append(start_tidx)
+            # For now, we are considering correct and "skipped" trials together:
+            if trig2 == 4 or trig2 == 2 or trig2 == 1:
+                correct_tidx = times_trimmed[j]
+                correct_tidxs.append(correct_tidx)
+            if trig2 == 32:
+                end_tidx = times_trimmed[j]
+                end_tidxs.append(end_tidx)
+                trial_number+=1
+        idx_df = pd.DataFrame({'start_tidxs':start_tidxs, 'correct_tidxs':correct_tidxs, 'end_tidxs':end_tidxs})
+        
+        start_times = raw_data.times[start_tidxs]
+        correct_times = raw_data.times[correct_tidxs]
+        end_times = raw_data.times[end_tidxs]
+        times_df = pd.DataFrame({'start_times':start_times, 'correct_times':correct_times, 'end_times':end_times})
+        
+        # Format events in array recognizable by MNE:
+        event_array = np.zeros((len(start_tidxs)*num_trigs,3))
+        n = 0
+        for l in [start_tidxs, correct_tidxs, end_tidxs]:
+            for m in l:
+                if l == start_tidxs:
+                    event_array[n] = [m, 0, 16]
+                elif l == correct_tidxs:
+                    event_array[n] = [m, 0, 4]
+                elif l == end_tidxs:
+                    event_array[n] = [m, 0, 32]
+                n+=1
+
+        # Define event dictionary for MNE:
+        event_dict = {
+            'Start': 16,
+            'Correct': 4,
+            'End': 32
+        }
+        
+        return idx_df, times_df, event_dict, event_array
+    
+    else:
+        print('\nInvalid task definition, please choose either "GoNogo_py", "GoNogo", or "iSpy"')
+
+# Function to generate Welch PSDs for each epoch:
+def calc_welch(X, Fs):
+    
+    # frequency_bands = {'delta': [1, 4],
+    #                    'theta': [4, 8],
+    #                    'alpha': [8, 13],
+    #                    'beta': [13, 30],
+    #                    'gamma': [30, 80],
+    #                    'all': [0,80]
+    #                    }
+    
+    # Generate PSD for every channel in every epoch:
+    # psd_accumulator = []
+    psds = np.zeros((X.shape[0], X.shape[1], int(Fs//2 + 1)))
+    
+    # Get mean PSD for each channel across all epochs:
+    for epoch in range(X.shape[0]):
+        for ch in range(X.shape[1]):
+            fxx, Pxx = welch(X[epoch, ch, :], fs=Fs, nperseg=512, nfft=Fs)
+            psds[epoch, ch, :] = Pxx
+    
+    # # Now separate PSDs into frequency bands:
+    # band_psds = {band: np.zeros((X.shape[1], frequency_bands[band][1] - frequency_bands[band][0])) for band in frequency_bands}
+    # for band in frequency_bands:
+    #     band_psds[band] = psds[:, frequency_bands[band][0]:frequency_bands[band][1]]
+    
+    # return band_psds
+    
+    return psds
+    
+    # ARCHIVED CODE:
+    # for i in frequency_bands:
+    #     globals()['psd_' + i] = psds[:, :, np.arange(frequency_bands[i][0], frequency_bands[i][1], 1)]
+    #     #globals()['psd_' + i] = np.mean(np.mean(globals()['psd_' + i], axis=1), axis=1)
+    
+    # return psd_delta, psd_theta, psd_alpha, psd_beta, psd_gamma, psd_all
+    # freq_range = np.where((PSDfreqs >= 4) & (PSDfreqs <=43))[0]
+
+    # # Calculate percentage of total power in each band (baselining)
+    # dataPSD = 100 * (dataPSD[:, :, freq_range] / simpson(dataPSD[:, :, freq_range])[:,:,None])
+
+    #return dataPSD
+
+# Function to perform time-frequency analysis using Morlet wavelets (UNDER DEVELOPMENT):
+def morlet_analysis(X, Fs, n_freqs, min_freq, max_freq, n_cycles):
+    '''
+    Performs a Morlet wavelet analysis on the input data (X) at a 
+    specified sampling rate (Fs), using user-specified frequencies
+    (n_freqs) in between user-specified specified minimum (min_freq) and maximum
+    (max_freq) frequences, and number of cycles (n_cycles).
+    '''
+    
+    freqs = np.linspace(min_freq, max_freq, n_freqs)
+    
+    n_timepoints = X.shape[2]
+    n_epochs = X.shape[0]
+    n_channels = X.shape[1]
+    wavelet_data = np.zeros((n_epochs, n_channels, n_freqs, n_timepoints))
+    
+    power_trials = np.zeros((n_epochs, n_channels, len(freqs), n_timepoints))
+    
+    for epochidx, epoch in tqdm(enumerate(X), total=n_epochs):
+        epoch = epoch.reshape(1, n_channels, n_timepoints)
+        power = mne.time_frequency.tfr_array_morlet(epoch, Fs, freqs, n_cycles, output='power', decim=1, n_jobs=1, verbose=None)
+        power_trials[epochidx,:,:,:] = power
+    
+    return power_trials
+    
+    
+    # for epochidx in range(n_epochs):
+    #     for chidx in range(n_channels):
+    #         for freqidx, freq in enumerate(freqs):
+    #             wavelet = morlet(int(Fs * n_cycles / (2 * np.pi * freq)), w=n_cycles, s=1/freq, complete=True)
+    #             convolution_result = convolve(X[epochidx, chidx, :], wavelet, mode='same')
+    #             wavelet_data[epochidx, chidx, freqidx, :] = np.abs(convolution_result) ** 2
+
+# Function to calculate coherence between every pair of channels in a given array of trials:
+def calc_coherence(X, Fs, nperseg, nfft):
+    n_channels = X.shape[1]
+    coherence = np.zeros((n_channels, n_channels))
+    for i in range(n_channels):
+        for j in range(n_channels):
+            f, Cxy = coherence(epoch[i,:], epoch[j,:], fs=Fs, nperseg=nperseg, nfft=nfft)
+            coherence[i,j] = np.mean(Cxy)
+    return coherence
+
+# Function to perform time-frequency analysis using Multitaper method:
+def multitaper_analysis(X, Fs, n_freqs, min_freq, max_freq, n_jobs):
+    '''
+    Performs a multitaper analysis on the input data (X) at a 
+    specified sampling rate (Fs), using user-specified frequencies
+    (n_freqs) in between user-specified specified minimum (min_freq) and maximum
+    (max_freq) frequences, and number of cycles (n_cycles).
+    '''
+    
+    freqs = np.linspace(min_freq, max_freq, n_freqs)
+    
+    n_timepoints = X.shape[2]
+    n_epochs = X.shape[0]
+    n_channels = X.shape[1]
+    n_cycles = freqs / 2
+    time_bandwidth = 4
+    
+    power_trials = np.zeros((n_epochs, n_channels, len(freqs), n_timepoints))
+    
+    for epochidx, epoch in enumerate(X):
+        epoch = epoch.reshape(1, n_channels, n_timepoints)
+        power = mne.time_frequency.tfr_array_multitaper(epoch, sfreq=Fs, freqs=freqs, n_cycles=n_cycles, time_bandwidth=time_bandwidth, output='avg_power', n_jobs=n_jobs, verbose=False)
+        power_trials[epochidx,:,:,:] = power
+        
+    # Now let's calculate the average power across all trials in each channel:
+    # avg_power = np.mean(power_trials, axis=0)
+    # And then scale it logarithmically:
+    # avg_power = np.log10(avg_power)
+    
+    # # Create a big subplot with average power across all channels as a separate subplot:
+    # nrows = floor(sqrt(n_channels))
+    # ncols = ceil(sqrt(n_channels))
+    # fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=(20,20))
+    # for ch in range(n_channels):
+    #     ax[ch//ncols, ch%ncols].imshow(avg_power[ch], cmap='hot', aspect='auto', origin='lower')
+    #     ax[ch//ncols, ch%ncols].set_title('Channel ' + str(ch+1))
+    # fig.tight_layout
+        
+    # ax.imshow(avg_power, cmap='jet', aspect='auto', origin='lower')
+    # ax.set_title('Average power across all trials')
+    
+    # Return both the average power across all trials, and the power for each trial:
+    return power_trials
+
+def calc_connectivity(X, Fs, nperseg, nfft):
+    mne.spectral_connectivity_epochs(X, method='coh', sfreq=Fs, fmin=1, fmax=80, faverage=True, n_jobs=1, mt_adaptive=False, nperseg=nperseg, nfft=nfft, verbose=None)
+
+# Function to identify AAL labels based on electrode coordinates:
+def aal_labeller(chs):
+    # chs is a dataframe containing electrode labels and coordinates
+    
+    electrodes_df = chs.copy()
+    
+    # Load AAL atlas labels/coordinates:
+    if os.path.exists('/d/gmi/1/karimmithani/seeg/metadata/aal_labels_coordinates.csv'):
+        aal_labels = pd.read_csv('/d/gmi/1/karimmithani/seeg/metadata/aal_labels_coordinates.csv')
+        # Some of the aal_labels use the wrong type of hyphen as a minus sign, so let's replace them all with the correct one:
+        aal_labels['x_mni'] = aal_labels['x_mni'].str.replace('−', '-').astype(float)
+        aal_labels['y_mni'] = aal_labels['y_mni'].str.replace('−', '-').astype(float)
+        aal_labels['z_mni'] = aal_labels['z_mni'].str.replace('−', '-').astype(float)
+        # For each x_mni, y_mni, and z_mni in chs, find the closest match in aal_labels and extract the 'aal_label' from the corresponding row
+        # To do this, we will first define a function to calculate the Euclidean distance between two points in 3D space:
+        def euclidean_distance(x1, y1, z1, x2, y2, z2):
+            # Convert each of these inputs into integers:
+            x1 = int(x1)
+            y1 = int(y1)
+            z1 = int(z1)
+            x2 = int(x2)
+            y2 = int(y2)
+            z2 = int(z2)
+            return sqrt((x1-x2)**2 + (y1-y2)**2 + (z1-z2)**2)
+        def nearest_region(electrode_coords, aal_df):
+            distances = aal_df.apply(lambda row: euclidean_distance(electrode_coords['x_mni'], electrode_coords['y_mni'], electrode_coords['z_mni'], row['x_mni'], row['y_mni'], row['z_mni']), axis=1)
+            min_index = distances.idxmin()
+            return aal_df.loc[min_index, 'aal_label']
+        electrodes_df['aal_label'] = electrodes_df.apply(lambda row: nearest_region(row, aal_labels), axis=1)
+        return electrodes_df
+    else:
+        return('ERROR: AAL labels file not found. Please ensure that the file "aal_labels_coordinates.csv" is located in the directory "/d/gmi/1/karimmithani/seeg/metadata/"')
+
+# Testing an alternatite method for AAL labelling, using Simeon's fuzzy search:
+def lookup_aal_region(
+    coords_mm: Tuple[float, float, float],
+    fuzzy: bool = False,
+    atlas_data: Union[
+        str, np.ndarray] = '/d/gmi/1/simeon/clas/repos/atlasreader/atlasreader/data/atlases/AAL3/AAL3v1_1mm.nii.gz',
+    atlas_labels: Union[
+        str, pd.DataFrame] = '/d/gmi/1/simeon/clas/repos/atlasreader/atlasreader/data/atlases/AAL3/AAL3v1_1mm.nii.txt',
+) -> Tuple[int, str, bool]:
+    '''
+    Lookup AAL region for a given coordinate, using the AAL3 atlas. If fuzzy is True, then the nearest region within 5mm is returned.
+    '''
+
+    # load atlas
+    if isinstance(atlas_data, str):
+        atlas = nib.load(atlas_data)
+        atlas_data = atlas.get_fdata().astype(int)
+    elif not isinstance(atlas_data, np.ndarray):
+        raise ValueError('atlas_data must be a string or numpy array')
+
+    # load atlas labels
+    if isinstance(atlas_labels, str):
+        atlas_labels = pd.read_csv(atlas_labels, sep=' ', header=None)
+        atlas_labels.set_index(0, inplace=True)
+        atlas_labels.rename(columns={1: 'label'}, inplace=True)
+        atlas_labels = atlas_labels['label']
+
+    elif not isinstance(atlas_labels, np.ndarray):
+        raise ValueError('atlas_labels must be a string or pandas dataframe')
+
+    # convert coords from mm to voxels using affine
+    coords_mm = np.array(coords_mm)
+    coords_vx = nib.affines.apply_affine(np.linalg.inv(atlas.affine), coords_mm)
+
+    # get voxel value
+    used_fuzzy = False
+    coords_vx = np.round(coords_vx).astype(int)
+    try:
+        voxel_value = atlas_data[coords_vx[0], coords_vx[1], coords_vx[2]]
+    except:
+        voxel_value = 0
+
+    # if fuzzy, and voxel_value = 0, do nearest neighbor
+    if fuzzy and voxel_value == 0:
+        # initialize distances if needed
+        global distances_5x5
+        if distances_5x5 is None:
+            distances_5x5 = np.zeros((11, 11, 11))
+            for x in range(11):
+                for y in range(11):
+                    for z in range(11):
+                        distances_5x5[x, y, z] = np.linalg.norm(np.array([5, 5, 5]) - np.array([x, y, z]))
+
+        # check if the distances box will exceed image boundaries (super edgy case)
+        trim = np.zeros((3, 2), dtype=int)
+        for i in range(3):
+            if coords_vx[i] - 5 < 0:
+                trim[i, 0] = 5 - coords_vx[i]
+            if coords_vx[i] + 6 > atlas_data.shape[i]:
+                trim[i, 1] = coords_vx[i] + 6 - atlas_data.shape[i]
+
+        # get nearest voxel that is not zero, but less than 5 voxels away
+        selected_atlasdata = atlas_data[(coords_vx[0] - 5 + trim[0, 0]):(coords_vx[0] + 6 - trim[0, 1]),
+                                        (coords_vx[1] - 5 + trim[1, 0]):(coords_vx[1] + 6 - trim[1, 1]),
+                                        (coords_vx[2] - 5 + trim[2, 0]):(coords_vx[2] + 6 - trim[2, 1])]
+        trimmed_distances = distances_5x5[trim[0, 0]:(-1 * trim[0, 1]) if trim[0, 1] != 0 else None,
+                                          trim[1, 0]:(-1 * trim[1, 1]) if trim[1, 1] != 0 else None,
+                                          trim[2, 0]:(-1 * trim[2, 1]) if trim[2, 1] != 0 else None]
+
+        distances = np.ma.masked_where((selected_atlasdata == 0) | (trimmed_distances > 5), trimmed_distances)
+        nearest_voxel = np.unravel_index(np.argmin(distances), distances.shape)
+        voxel_value = selected_atlasdata[nearest_voxel]
+
+        used_fuzzy = True
+
+    # get label
+    if voxel_value > 0:
+        region_name = atlas_labels[voxel_value]
+    else:
+        region_name = ''
+
+    return voxel_value, region_name, used_fuzzy
+
+# Detect stimulation trials using artifacts:
+def detect_stims(event_array, vs_channel_label, stim_thresh=20):
+    '''
+    Detect trials where stimulation was delivered
+    Meant to be used for CLES and OLES trials only
+    
+    
+    '''
+    
+    stim_trials = {}
+    
+    vs_channel_idx = chs.index[chs['Label'] == vs_channel_label].tolist()[0]
+    
+    for event in event_array:
+        stim_trials[event]  = []
+        for trialidx, trial in enumerate(event_array[event]):
+            # Covnert trial timeseries to z-score
+            trial_normalized = stats.zscore(trial[vs_channel_idx,:])
+            if np.any(abs(trial_normalized) > stim_thresh):
+                stim_trials[event].append(trialidx)
+                # print('STIM DETECTED!')
+                plt.plot(trial_normalized)
+    plt.show()
+    
+    return stim_trials
+    
+
+######################################################################################################################################################################################################
+# Main script:
+######################################################################################################################################################################################################
+
+# Create directories:
+if not os.path.exists(rawdata_dir):
+    print('Creating directory:', rawdata_dir)
+    os.makedirs(rawdata_dir)
+if not os.path.exists(processed_dir):
+    print('Creating directory:', processed_dir)
+    os.makedirs(processed_dir)
+
+# Read and parse subjects file
+s = open(subjects_file)
+s = s.read()
+input_files = s.split('\n')
+input_files = [i for i in input_files if not i.startswith('#')] # Remove blank entries
+    
+# Run metadata generator:
+if metadata_config == 'y' or metadata_config == 'yes':
+    for i in input_files:
+        l = i.split(',')
+        j = l[0].split('_')
+        task = l[1]
+        subj_processed_dir = os.path.join(processed_dir,j[0])
+        interm_dir = os.path.join(subj_processed_dir,j[1])
+        subj_timepoint_processed_dir = os.path.join(interm_dir,task)
+        if not os.path.exists(subj_processed_dir):
+            print('Creating directory:',subj_processed_dir)
+            os.makedirs(subj_processed_dir)
+        if not os.path.exists(interm_dir):
+            print('Creating directory:',interm_dir)
+            os.makedirs(interm_dir)
+        if not os.path.exists(subj_timepoint_processed_dir):
+            print('Creating directory:',subj_timepoint_processed_dir)
+            os.makedirs(subj_timepoint_processed_dir)
+        subprocess.run('python edf_metadata_generator_km.py ' + os.path.join(rawdata_dir,l[0]) + ' --outdir ' + processed_dir, shell=True)
+    # print('\nBefore continuing, please ensure electrodes are named correctly, identify which electrodes are SEEG, and modify the "labels.csv" file accordingly.')
+    # time.sleep(5)
+    # input('\nPress Enter to continue')
+    
+subj = '' # Initialize subj variable so that we can skip redundant steps
+
+# Load EDF files
+for i in input_files:
+    l = i.split(',')
+    j = l[0].split('_')
+    print('\n','*'*10, 'Loading data from:', l[0], '*'*10)
+    task = l[1] # Options include: SetShifting, GoNogo, iSpy
+    print('\nThe task associated with this file is:', task, '\n')
+    trigdef = os.path.join(metadata_dir,task + '.json')
+    currsubj = subj # Use this to skip channel verification while we're on the same subject
+    subj = j[0]
+    subj_prefix = j[0] + '_' + j[1] + '_' + task
+    subj_processed_dir = os.path.join(processed_dir,j[0])
+    interm_dir = os.path.join(subj_processed_dir,j[1])
+    subj_timepoint_processed_dir = os.path.join(interm_dir, task)
+    jf_fname = (l[0].split('.')[0] + '.meta.json') # Generated in standard format from edf_metadata_generator_km.py (previous step above)
+
+    # Read subject-specific metadata file generated with edf_metadata_generator:
+    json_data = json.load(open(os.path.join(interm_dir, jf_fname)))
+    
+    # Modify the labels file so that it can run with the way Nebras and Simeon coded their SEEG script previously
+    # Assumes everything before 'Fp1' is a SEEG electrode
+    # Let user know that you are doing this, and give them an option to modify if needed
+    chs = pd.read_csv(os.path.join(interm_dir, json_data.get('channel_labels')))
+    labs_seeg = []
+    for labidx, lab in enumerate(chs.loc[:,'Pinbox']):
+        if lab != 'Fp1': # This is USUALLY the first non-SEEG electrode
+            labs_seeg.append(lab)
+            chs.loc[labidx,'Label'] = lab
+            chs.loc[labidx,'Type'] = 'SEEG'
+        else:
+            break
+    print(f'\nThe following channels have been identified as SEEG: {labs_seeg}')
+    time.sleep(1) # Give user a chance to read this
+    if subj == currsubj: # If we're still on the same subject, skip channel verification
+        print('\nSkipping channel verification for this file\n')
+    else:
+        tmpinput = input('\nIs this correct? (y/n): ')
+        if tmpinput == 'n':
+            incorrect_labs = input('List all channels, comma-separated (no spaces), that should not be included: ')
+            incorrect_labs = incorrect_labs.split(',')
+            # Remove incorrect channels from chs dataframe:
+            for incorrectidx, incorrect in enumerate(incorrect_labs):
+                chs.loc[chs.Label == incorrect, 'Type'] = 'NaN' # No longer marked as 'SEEG' so that it is removed from analysis in later step
+            print(f'The following channels have been removed from SEEG analysis: {incorrect_labs}')
+    
+    # Load EDF file
+    raw_data = mne.io.read_raw_edf(os.path.join(rawdata_dir, json_data.get('filename')), preload=True)
+    Fs = raw_data.info['sfreq']
+    
+    # Load trigger file, generated with edf_metadata_generator:
+    trigs = pd.read_csv(os.path.join(interm_dir, json_data.get('triggers' + trigtype)))
+    trig_map = json.load(open(trigdef))
+    
+    # See if user specified start time and/or stop time, and if so then replace this in json file
+    try:
+        l[2]
+    except IndexError:
+        user_ss_exists = False
+    else:
+        user_ss_exists = True
+    if user_ss_exists:
+        if l[2] != '':
+            print(f'\nUser-specified sample start time is index: {l[2]}')
+            json_data['sample_start'] = int(l[2])
+    
+    try:
+        l[3]
+    except IndexError:
+        user_se_exists = False
+    else:
+        user_se_exists = True
+    if user_se_exists:
+        if l[3] != '':
+            print(f'\nUser-specified sample end time is index: {l[3]}')
+            json_data['sample_end'] = int(l[3])
+
+    # Load sample start and end times, and filter triggers to include only that epoch
+    ss = json_data.get('sample_start')
+    se = json_data.get('sample_end')
+    trigs = trigs[(trigs['idx'] >= ss) & (trigs['idx'] <= se)]
+    
+    # Define and calculate triggers for the selected task
+    print('\nCalculating Triggers for task', task,'...')
+    idx_df, times_df, event_dict, event_array = calcTrigs(raw_data, trigs, task)
+    print('\nTriggers successfully calculated\n')
+    
+    # If the task is GoNogo or GoNogo_py, calculate reaction times and accuracy:
+    if task == 'GoNogo_py' or task == 'GoNogo' or task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL':
+        # First create a temporary dataframe for go and nogo trials, combining the correct and incorrect trials:
+        # Start by concatenating go and nogo correct and incorrect times:
+        reaction_times = {}
+        accuracy = {}
+        for condition in ['go','nogo']:
+            # Combine correct and incorrect times, sort them, and then merge with start_times:
+            rt_df = times_df.copy()
+            rt_df[f'{condition}_btnpress'] = pd.concat((times_df[f'{condition}_correct_times'].dropna(), times_df[f'{condition}_incorrect_times'].dropna()), ignore_index=True).sort_values().reset_index(drop=True)
+            rt_df[f'{condition}_rt'] = rt_df[f'{condition}_btnpress'] - rt_df[f'{condition}_start_times']
+            # Now create separate arrays for correct and incorrect RTs:
+            rt_df[f'{condition}_correct_rt'] = np.nan
+            rt_df[f'{condition}_incorrect_rt'] = np.nan
+            for outcome in ['correct', 'incorrect']:
+                for idx, row in rt_df.iterrows():
+                    if row[f'{condition}_btnpress'] not in rt_df[f'{condition}_{outcome}_times'].values:
+                        row[f'{condition}_{outcome}_rt'] = np.nan
+                    else:
+                        row[f'{condition}_{outcome}_rt'] = row[f'{condition}_btnpress'] - row[f'{condition}_start_times']
+                    # Append this row to the dataframe:
+                    rt_df.iloc[idx] = row
+                # And add to reaction_times dictionary:
+                reaction_times[f'{condition}_{outcome}_rt'] = rt_df[f'{condition}_{outcome}_rt'].dropna().values
+            
+            # Now let's calculate accuracy:
+            tmp_accuracy = {}
+            for outcome in ['correct', 'incorrect']:
+                tmp_accuracy[f'{condition}_{outcome}'] = len(times_df[f'{condition}_{outcome}_times'].dropna())
+            accuracy[f'{condition}_accuracy'] = tmp_accuracy[f'{condition}_correct'] / (tmp_accuracy[f'{condition}_correct'] + tmp_accuracy[f'{condition}_incorrect'])
+        # Save reaction_times and accuracy:
+        with open (os.path.join(interm_dir, f'{task}/reaction_times.pkl'), 'wb') as f:
+            pickle.dump(reaction_times, f)
+        with open (os.path.join(interm_dir, f'{task}/accuracy.pkl'), 'wb') as f:
+            pickle.dump(accuracy, f)
+        print('\nReaction times and accuracy successfully calculated and saved\n')
+    
+     
+    # Parse channel names and choose only seeg for analysis
+    #chs = pd.read_csv(os.path.join(interm_dir, json_data.get('channel_labels')))
+    chs = chs[chs['Type'] == 'SEEG']
+    
+    # Now let's extract MNI coordinates for each SEEG electrode and append to chs dataframe:
+    # First, let's make sure that the MNI coordinates file (which is always saved as subj_processed_dir/subj_electrode_labels.csv) exists; if it doesn't, skip this step:
+    localization_completed = False
+    if os.path.exists(os.path.join(subj_processed_dir, subj + '_electrode_labels.csv')):
+        print('MNI coordinates file found\n')
+        localization_completed = True
+        # Then let's load the MNI coordinates file
+        mni_coords = pd.read_csv(os.path.join(subj_processed_dir, subj + '_electrode_labels.csv'))
+        # Intersect the two dataframes to get only the SEEG electrodes, and only the x_mni, y_mni, z_mni, and DataValid columns from mni_coords
+        chs = pd.merge(chs, mni_coords[['Label', 'x_mni', 'y_mni', 'z_mni', 'DataValid']], on='Label', how='inner')
+        # Let's rename DataValid_y to DataValid, and drop DataValid_x
+        chs = chs.rename(columns={'DataValid_y':'DataValid'})
+        chs = chs.drop(columns=['DataValid_x'])
+        # Then remove rows where DataValid is 'n'
+        chs = chs[chs['DataValid'] != 'n']
+        # And then store the MNI coordinates of the remaining (i.e. DataValid = y) electrodes as a list of tuples:
+        mni_coords = [(x, y, z) for x, y, z in zip(chs['x_mni'], chs['y_mni'], chs['z_mni'])]
+        
+    ch_names = [x for x in chs['Label'].values]
+    ch_map = zip([x for x in chs['Pinbox'].values],
+                    [x for x in chs['Label'].values])
+    mne.rename_channels(raw_data.info, {x: y for x, y in ch_map})
+
+    # Pick SEEG channels only in the MNE raw instance for analysis
+    raw_data = raw_data.pick(ch_names)
+    
+    # Create bipolar montage if requested:
+    if montage == 'bipolar':
+        print('Bipolar montage selected\n')
+        raw_data = mne.set_bipolar_reference(raw_data, anode=ch_names[:-1], cathode=ch_names[1:])
+        
+        # Drop bipolar references between distinct electrodes
+        # I tried making this simpler (i.e. skipping "bipchs" but it didn't work... This worked for Nebras so will keep it as is)
+        # We also need to update mni_coords and aal_labels to reflect the new bipolar montage
+        ls = raw_data.ch_names
+        bipchs = []
+        for ch in ls:
+            if '-' in ch:
+                bipchs.append(ch)
+        ch_names = []
+        if localization_completed:
+            bipcoords = []
+        # bip_aal_labels = []
+        # bip_aal_fuzzy = []
+        for cidx, ch in enumerate(bipchs):
+            c_elec = re.split(r'(\d+)', ch.split('-')[0])[0]
+            a_elec = re.split(r'(\d+)', ch.split('-')[1])[0]
+            if c_elec == a_elec:
+                ch_names.append(ch)
+                if localization_completed:
+                    bipcoords.append(np.mean((mni_coords[cidx], mni_coords[cidx+1]), axis=0))
+                # bip_aal_labels.append(aal_labels[cidx])
+                # bip_aal_fuzzy.append(fuzzy_labelsonly[cidx])
+        
+        if localization_completed:
+            # Update chs dataframe to reflect new bipolar montage:
+            chs = pd.DataFrame({'Pinbox': ch_names, 'Label': ch_names, 'Type': 'SEEG', 'x_mni': [x[0] for x in bipcoords], 'y_mni': [x[1] for x in bipcoords], 'z_mni': [x[2] for x in bipcoords], 'DataValid': 'NaN'}) 
+            
+            # And update mni_coords to reflect new bipolar montage:
+            mni_coords = bipcoords
+        else:
+            # Update chs dataframe to reflect new bipolar montage:
+            chs = pd.DataFrame({'Pinbox': ch_names, 'Label': ch_names, 'Type': 'SEEG'})
+    elif montage == 'referential':
+        print('Referential montage selected\n')
+        
+        # Re-reference to a common average reference (CAR)
+        raw_data = raw_data.set_eeg_reference(ref_channels='average', projection=False)
+    else:
+        raise ValueError('Montage must be either "bipolar" or "referential"')
+
+    if os.path.exists(os.path.join(subj_processed_dir, subj + '_electrode_labels.csv')):
+        # Now let's use the aal_labeller function to identify AAL labels for each electrode:
+        print('\nGenerating AAL labels...\n')
+        chs = aal_labeller(chs)
+        # Let's also try a different method of AAL labelling, using Simeon's fuzzy search:
+        distances_5x5 = None
+        # Loop through each electrode coordinate (x_mni, y_mni, and z_mni) in chs and find the nearest AAL region using lookup_aal_region:
+        fuzzy_labels = []
+        for x, y, z in zip(chs['x_mni'], chs['y_mni'], chs['z_mni']):
+            fuzzy_labels.append(lookup_aal_region((x, y, z), fuzzy=True))
+        # Now append just the second value in each tuple (i.e. the AAL label) to chs:
+        chs['aal_label_fuzzy'] = [x[1] for x in fuzzy_labels]
+        fuzzy_labelsonly = [x[1] for x in fuzzy_labels]
+        # Extract AAL labels from chs and save as a list:
+        aal_labels = [x for x in chs['aal_label'].values]
+        # Finally, let's save this dataframe as a csv file in the interm_dir, with a different name if bipolar montage selected:
+        if montage == 'bipolar':
+            chs.to_csv(os.path.join(subj_processed_dir, subj + '_electrode_labels_aal_bipolar.csv'), index=False)
+        else:
+            chs.to_csv(os.path.join(subj_processed_dir, subj + '_electrode_labels_aal.csv'), index=False)
+    
+    # Plot pre-filtered PSD for comparison:
+    # Save this in a temporary directory, as it is only for comparison purposes:
+    misc_dir = os.path.join(interm_dir, 'misc')
+    if not os.path.exists(misc_dir):
+        print('Creating directory:',misc_dir)
+        os.makedirs(misc_dir)
+    if generate_graphs != 'n':
+        raw_data.compute_psd().plot()
+        if montage == 'bipolar':
+            plt.savefig(os.path.join(misc_dir, subj_prefix + '_unfiltered_PSD_bipolar.png'))
+        else:
+            plt.savefig(os.path.join(misc_dir, subj_prefix + '_unfiltered_PSD.png'))
+    
+    # Filter data to remove noise. These are chosen to concord closely with the livestream curry filter parameters
+    lf = 1
+    filt_sos = signal.bessel(2, lf, btype='highpass', output='sos', fs=Fs) # Bessel highpass filter
+    raw_data._data = signal.sosfilt(
+        filt_sos, raw_data._data)
+    iirb, iira = signal.iirnotch(60, 40, fs=Fs)  # Notch filter at 60Hz
+    raw_data._data = signal.lfilter(
+        iirb, iira, raw_data._data)
+    iirb, iira = signal.iirnotch(120, 40, fs=Fs)  # And also harmonics
+    raw_data._data = signal.lfilter(
+        iirb, iira, raw_data._data)
+    
+    # Plot PSD of filtered raw signal:
+    if generate_graphs != 'n':
+        raw_data.compute_psd().plot()
+        if montage == 'bipolar':
+            plt.savefig(os.path.join(misc_dir, subj_prefix + '_filtered_PSD_bipolar.png'))
+        else:
+            plt.savefig(os.path.join(misc_dir, subj_prefix + '_filtered_PSD.png'))
+        plt.close()
+       
+    # Epoch data using events, depending on which task is specified:
+    if task == 'GoNogo' or task == 'GoNogo_py' or task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL':
+        print('\nEpoching data...\n')
+        epoch_data = mne.Epochs(raw_data, event_array.astype(int), event_id=event_dict, tmin=-2, tmax=2, picks=ch_names, baseline=None, preload=True, event_repeated='merge', on_missing='ignore')
+        X = epoch_data.get_data()
+    elif task == 'iSpy':
+        print('\nEpoching data...\n')
+        epoch_data = mne.Epochs(raw_data, event_array.astype(int), event_id=event_dict, tmin=-2, tmax=2, picks=ch_names, baseline=None, preload=True, event_repeated='drop', on_missing='ignore')
+        X = epoch_data.get_data()
+        
+        # Epoch data from start of trial to end of trial and save as a list of epochs, with each row corresponding to the stimulus number shown:
+        startstop_epochs_list=[]
+        startstop_eventdict = {
+            'Start': 16,
+            #'End': 32
+        }
+        start_indices = epoch_data['Start'].events[:,0]
+        stop_indices = epoch_data['End'].events[:,0]
+        for start, stop in zip(start_indices, stop_indices):
+            # Create a custom  event for each trial between the start and stop indices:
+            startstop_eventarray = np.array([[start, 0, 16], [stop, 0, 32]])
+            # From the start of each event, calculate the number of seconds until the end of the event:
+            tmin = 0
+            tmax = raw_data.times[stop] - raw_data.times[start]
+            # Now generate an epoch for this trial, with the start and stop times defined above:
+            startstop_epoch = mne.Epochs(raw_data, startstop_eventarray.astype(int), event_id=startstop_eventdict, tmin=tmin, tmax=tmax, picks=ch_names, baseline=None, event_repeated='drop')
+            # Append each epoch to a list:
+            startstop_epochs_list.append(startstop_epoch)
+            
+        # Now repeat this but from start of trial to correct response:
+        startcorrect_epochs_list=[]
+        startcorrect_eventdict = {
+            'Start': 16,
+            #'Correct': 4
+        }
+        start_indices = epoch_data['Start'].events[:,0]
+        correct_indices = epoch_data['Correct'].events[:,0]
+        for start, correct in zip(start_indices, correct_indices):
+            # Create a custom event for each trial between the start and correct indices:
+            startcorrect_eventarray = np.array([[start, 0, 16], [correct, 0, 4]])
+            # From the start of each event, calculate the number of seconds until the object is correctly identified:
+            tmin = 0
+            tmax = raw_data.times[correct] - raw_data.times[start]
+            # Now generate an epoch for this trial, with the start and 'correct' times defined above:
+            startcorrect_epoch = mne.Epochs(raw_data, startcorrect_eventarray.astype(int), event_id=startcorrect_eventdict, tmin=tmin, tmax=tmax, picks=ch_names, baseline=None, event_repeated='drop')
+            # Append each epoch to a list:
+            startcorrect_epochs_list.append(startcorrect_epoch)
+
+        # For each stimulus, get the raw timeseries data and save as a separate array into a list:
+        startstop_XX = []
+        startcorrect_XX = []
+        for epoch in startstop_epochs_list:
+            startstop_XX.append(epoch.get_data())
+        for epoch in startcorrect_epochs_list:
+            startcorrect_XX.append(epoch.get_data())
+        
+        # # We can remove the first dimension of each of the arrays in these two lists as they are redundant:
+        # for stim in range(len(startstop_XX)):
+        #     startstop_XX[stim] = np.squeeze(startstop_XX[stim], axis=0)
+        # for stim in range(len(startcorrect_XX)):
+        #     startcorrect_XX[stim] = np.squeeze(startcorrect_XX[stim], axis=0)
+            
+    # X is a 3D array formatted as follows: [trials, contacts, timeseries]
+    # XX is a list of 3D arrays in the format of X
+    
+    # Plot mean of timeseries data across all trials at each contact for quick visualization:
+    if task != 'iSpy' and generate_graphs != 'n':
+        t_original = np.linspace(-2, 2, int(Fs*4) + 1)
+        if montage == 'bipolar':
+            graph_path = os.path.join(subj_timepoint_processed_dir,'graphs_bipolar')
+        else:
+            graph_path = os.path.join(subj_timepoint_processed_dir,'graphs_referential')
+        if generate_graphs != 'n':
+            for ch in range(X.shape[1]):
+                plt.plot(t_original, np.mean(X[:, ch, :], axis=0), '.-')
+                plt.legend(['data', 'resampled'], loc='best')
+                if not os.path.isdir(graph_path): os.makedirs(graph_path)
+                plt.savefig(os.path.join(graph_path, '%s.png' % ch_names[ch]))
+                plt.close()
+        
+    # Generate some task-specific graphs for quick visualization:
+    if task == 'GoNogo' or task == 'GoNogo_py' or task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL':
+        # Compare "nogo correct" vs. "nogo  incorrect" trials
+        graph_path = os.path.join(subj_timepoint_processed_dir,'GoNogo_graphs')
+        if montage == 'bipolar':
+            task_graph_path = os.path.join(graph_path, 'graphs_bipolar')
+        else:
+            task_graph_path = os.path.join(graph_path, 'graphs_referential')
+        X_nogo_correct = epoch_data["Nogo Correct"].get_data()
+        X_nogo_incorrect = epoch_data["Nogo Incorrect"].get_data()
+        if generate_graphs != 'n':
+            if not os.path.exists(task_graph_path): os.makedirs(task_graph_path)
+            for ch in range(X.shape[1]):
+                plt.plot(t_original, np.mean(X_nogo_correct[:, ch, :], axis=0), '.-g', 
+                        t_original, np.mean(X_nogo_incorrect[:, ch, :], axis=0), '.-r',
+                        linewidth = 1, alpha = 0.25)
+                plt.legend(['NoGo Correct', 'NoGo Incorrect'], loc='best')
+                plt.title('Channel: ' + ch_names[ch])
+                plt.savefig(os.path.join(task_graph_path, '%s.png' % ch_names[ch]))
+                plt.close()
+    elif task == 'iSpy':
+        # Create a separate folder for each stimulus, and generate a graph for each channel:
+        # Focus on only start to end for now, ignore start to correct for time being
+        ispy_graph_path = os.path.join(subj_timepoint_processed_dir, 'iSpy_graphs')
+        for stimidx, stim in enumerate(startstop_XX):
+            t_original = np.arange(0,stim.shape[2])/Fs
+            graph_path = os.path.join(ispy_graph_path, f'iSpy_graphs_{stimidx}')
+            print(f'\nGenerating graphs for stimulus {stimidx}...\n')
+            if montage == 'bipolar':
+                task_graph_path = os.path.join(graph_path, 'graphs_bipolar')
+            else:
+                task_graph_path = os.path.join(graph_path, 'graphs_referential')
+            if generate_graphs != 'n':
+                if not os.path.exists(task_graph_path): os.makedirs(task_graph_path)
+                for ch in range(stim.shape[1]):
+                    plt.plot(t_original, np.mean(stim[:, ch, :], axis=0), '.-b', 
+                            linewidth = 1, alpha = 0.25)
+                    plt.legend(['Start to End'], loc='best')
+                    plt.title('Channel: ' + ch_names[ch])
+                    plt.savefig(os.path.join(task_graph_path, '%s.png' % ch_names[ch]))
+                    plt.close()
+    
+    start = int(start_epoch*Fs)
+    stop = int(stop_epoch*Fs)
+    
+    # Identify relevant events for each task, then generate separate arrays for each identified event:
+    if task == 'GoNogo' or task == 'GoNogo_py' or task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL':
+        relevant_events = ['Nogo Correct', 'Nogo Incorrect', 'Go Correct', 'Go Incorrect']
+        for event in relevant_events: # Occasionally a subject will have no trials of a particular type, usually Go Incorrect trials
+            if event not in list(epoch_data.event_id.keys()):
+                print(f'\nEvent "{event}" not found. Removing...')
+                relevant_events.remove(event)
+    if task == 'iSpy':
+        relevant_events = ['Correct']
+    event_array = {event: epoch_data[event].get_data() for event in relevant_events}
+    # Recall that each array in event_array has the following format: [trials, contacts, timeseries]
+    # Now, trim each epoch to only include the user-specified start and stop times, and save to a single HDF5 file:
+    montage_dir = os.path.join(subj_timepoint_processed_dir, 'data_' + montage)
+    if not os.path.exists(montage_dir):
+        print('Creating directory:', montage_dir)
+        os.makedirs(montage_dir)
+    for event in relevant_events:
+        X_event = event_array[event]
+        event_mlarray = []
+        for epoch in range(X_event.shape[0]):
+            X_tmp = X_event[epoch, :, start:stop] # Get only data within user-specified range
+            event_mlarray.append(X_tmp)
+        event_array[event] = np.asarray(event_mlarray)
+    
+    # Detect stimulation trials if this is a STIM task
+    if 'STIM' in task:
+        vs_channel_label = vs_channel_labels[subj]
+        if montage != 'bipolar':
+            vs_channel_label = vs_channel_label.split('-')[0]
+        stim_trials = detect_stims(event_array, vs_channel_label, stim_thresh=20)
+        pickle.dump(stim_trials, open(os.path.join(subj_timepoint_processed_dir, f'{subj_prefix}_stim_trials.pkl'), 'wb'))
+    
+    if save_data == 'y':
+        outfile = os.path.join(montage_dir, f'{subj_prefix}_timeseries.h5')
+        with h5py.File(outfile, 'w') as hf:
+            for event in relevant_events:
+                hf.create_dataset(event, data=event_array[event])
+            hf.create_dataset('Channel Names', data=ch_names) # Add channel names as a separate dataset
+            if localization_completed:
+                hf.create_dataset('AAL Labels', data=aal_labels) # Add AAL labels as a separate dataset if localization was completed
+                hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly) # Add fuzzy labels as well
+                hf.create_dataset('MNI Coordinates', data=mni_coords)
+        print(f'\nTimeseries array saved as:', outfile)
+    
+    
+    # Now calculate welch PSD for each event and save to a single HDF5 file:
+    event_welch = {event: calc_welch(event_array[event], Fs) for event in relevant_events}
+    if save_data == 'y':
+        outfile = os.path.join(montage_dir, f'{subj_prefix}_welch_psds.h5')
+        with h5py.File(outfile, 'w') as hf:
+            for event in relevant_events:
+                hf.create_dataset(f'{event}', data=event_welch[event])
+            hf.create_dataset('Channel Names', data=ch_names) # Add channel names as a separate dataset
+            if localization_completed:
+                hf.create_dataset('AAL Labels', data=aal_labels) # Add AAL labels as a separate dataset
+                hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly) # Add fuzzy labels as well
+                hf.create_dataset('MNI Coordinates', data=mni_coords)
+        print(f'\nPSD array saved as:', outfile)
+        # Clear memory:
+    del event_welch
+    
+    # iSpy start/stop and start/correct timeseries need to be saved separately, as they are not all the same length:
+    if task == 'iSpy':
+        if save_data == 'y':
+            outfile = os.path.join(montage_dir, f'{subj_prefix}_startstop_timeseries.h5')
+            with h5py.File(outfile, 'w') as hf:
+                for stimidx, stim in enumerate(startstop_XX):
+                    hf.create_dataset(f'iSpy_{stimidx}', data=stim)
+                hf.create_dataset('Channel Names', data=ch_names) # Add channel names as a separate dataset
+                if localization_completed:
+                    hf.create_dataset('AAL Labels', data=aal_labels) # Add AAL labels as a separate dataset
+                    hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly) # Add fuzzy labels as well
+                    hf.create_dataset('MNI Coordinates', data=mni_coords)
+            print(f'\niSpy Start/Stop timeseries array saved as:', outfile)
+              
+    # Because the start/stop and start/correct epochs for iSpy are not all the same length, we need to calculate welch PSD for each epoch separately:
+    if task == 'iSpy':
+        ispy_welch = []
+        for stimidx, stim in enumerate(startstop_XX):
+            tmp_welch = calc_welch(stim, Fs)
+            ispy_welch.append(tmp_welch)
+
+        # ARCHIVED:
+        # It's going to get too complicated to store every band separately for every stimulus in this task, so let's just take the 'all' band:
+        # ispy_welch_allfreqs = [ispy_welch[stimidx]['all'] for stimidx, stim in enumerate(startstop_XX)]
+                
+        if save_data == 'y':
+            outfile = os.path.join(montage_dir, f'{subj_prefix}_startstop_welch_psds.h5')
+            with h5py.File(outfile, 'w') as hf:
+                for stimidx, stim in enumerate(ispy_welch):
+                    hf.create_dataset(f'iSpy_{stimidx}', data=ispy_welch[stimidx])
+                hf.create_dataset('Channel Names', data=ch_names) # Add channel names as a separate dataset
+                if localization_completed:
+                    hf.create_dataset('AAL Labels', data=aal_labels) # Add AAL labels as a separate dataset
+                    hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly) # Add fuzzy labels as well
+                    hf.create_dataset('MNI Coordinates', data=mni_coords)
+            print(f'\niSpy Start/Stop PSDs array saved as:', outfile)
+        del ispy_welch
+    
+    # Next, let's binarize slow vs. fast trials for each event and calculate time-resolved PSDs for each:
+    # Loop through reaction_times, convert to a dataframe, and get the index of fast vs. slow trials
+    event_altname_mapping = {'go_correct_rt': 'Go Correct', 'go_incorrect_rt': 'Go Incorrect', 'nogo_correct_rt': 'Nogo Correct', 'nogo_incorrect_rt': 'Nogo Incorrect'}
+    # Occasionally a subject will have no types of a particular trial, usually Go Incorrect; as such we have to check for this:
+    keys_to_check = list(event_altname_mapping.keys())
+    for event in keys_to_check:
+        if reaction_times[event].size == 0:
+            print(f'\nEvent "{event}" not found. Removing...')
+            event_altname_mapping.pop(event)
+            reaction_times.pop(event)
+    rt_event_array = {}
+    if task == 'GoNogo' or task == 'GoNogo_py' or task == 'GoNogo_pySTIMCL' or task == 'GoNogo_pySTIMOL':
+        for event in reaction_times.keys():
+            rt_event_array[event_altname_mapping[event]] = {}
+            rt_event_df = pd.DataFrame(reaction_times[event])
+            # Take the top and bottom third of reaction times as the threshold
+            upper_thresh = rt_event_df.quantile(0.80).values[0]
+            lower_thresh = rt_event_df.quantile(0.20).values[0]
+            # Get the index of fast vs. slow trials:
+            rt_type_idx = {}
+            for rt_type in ['fast', 'slow']:
+                if rt_type == 'fast':
+                    rt_type_idx[rt_type] = rt_event_df[rt_event_df < lower_thresh].dropna().index
+                elif rt_type == 'slow':
+                    rt_type_idx[rt_type] = rt_event_df[rt_event_df > upper_thresh].dropna().index
+            for rt_type in ['fast', 'slow']:
+                # Multitaper power estimates are computationally expensive, so let's average across trials for each event:
+                rt_event_array[event_altname_mapping[event]][rt_type] = event_array[event_altname_mapping[event]][rt_type_idx[rt_type]].mean(axis=0)
+        # Now calculate multitaper PSDs estimates for fast and slow trials for each event:
+        n_freqs = 90
+        min_freq = 1
+        max_freq = 90
+        n_jobs = 5
+        rt_psd = {}
+        for event in rt_event_array:
+            for rt_type in ['fast', 'slow']:
+                rt_event_array[event][rt_type] = np.expand_dims(rt_event_array[event][rt_type], axis=0)
+        for event in rt_event_array:
+            print(f'\nCalculating RT-associated time-resolved PSDs for {event}...\n')
+            rt_psd[event] = {}
+            for rt_type in ['fast', 'slow']:
+                rt_psd[event][rt_type] = multitaper_analysis(rt_event_array[event][rt_type], Fs, n_freqs, min_freq, max_freq, n_jobs)
+        if save_data == 'y':
+            outfile = os.path.join(montage_dir, f'{subj_prefix}_multitaper_psds_rt.h5')
+            with h5py.File(outfile, 'w') as hf:
+                for event in rt_psd:
+                    for rt_type in rt_psd[event]:
+                        hf.create_dataset(f'{event}_{rt_type}', data=rt_psd[event][rt_type])
+                hf.create_dataset('Channel Names', data=ch_names)
+                if localization_completed:
+                    hf.create_dataset('AAL Labels', data=aal_labels)
+                    hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly)
+                    hf.create_dataset('MNI Coordinates', data=mni_coords)
+        print(f'\nRT Multitaper PSD array saved as:', outfile)
+                
+            # # Now binarize the event_array for this event:
+            # event_array_fast = event_array[event][fast_idx]
+            # event_array_slow = event_array[event][slow_idx]
+            # # Now calculate welch PSD for each:
+            # event_welch_fast = calc_welch(event_array_fast, Fs)
+            # event_welch_slow = calc_welch(event_array_slow, Fs)
+            # # Save to a single HDF5 file:
+            # if save_data == 'y':
+            #     outfile = os.path.join(montage_dir, f'{subj_prefix}_welch_psds_{event}_fast.h5')
+            #     with h5py.File(outfile, 'w') as hf:
+            #         hf.create_dataset('Fast', data=event_welch_fast)
+            #         hf.create_dataset('Slow', data=event_welch_slow)
+            #         hf.create_dataset('Channel Names', data=ch_names)
+    
+    # # Next, let's calculate time-resolved PSDs for each trial in each event, using Morlet wavelet analysis:
+    # # First, let's define some parameters:
+    # n_freqs = 87
+    # min_freq = 4
+    # max_freq = 90
+    # n_cycles = 6
+    # for event in relevant_events:
+    #     print(f'\nCalculating Morlet PSD for {event}...\n')
+    #     event_morlet = morlet_analysis(event_array[event], Fs, n_freqs, min_freq, max_freq, n_cycles)
+    #     if save_data == 'y':
+    #         outfile = os.path.join(montage_dir, f'{subj_prefix}_morlet_psds_{event}.h5')
+    #         with h5py.File(outfile, 'w') as hf:
+    #             for event in relevant_events:
+    #                 hf.create_dataset(event, data=event_morlet)
+    #             hf.create_dataset('Channel Names', data=ch_names)
+    #             if localization_completed:
+    #                 hf.create_dataset('AAL Labels', data=aal_labels)
+    #                 hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly)
+    #                 hf.create_dataset('MNI Coordinates', data=mni_coords)
+    #     # Clear memory:
+    #     del event_morlet
+    # print(f'\nIndividual Morlet PSD arrays saved as:', outfile)
+    
+    # Next, calculate multitaper PSD for each event and save to a single HDF5 file:
+    n_freqs = 90
+    min_freq = 1
+    max_freq = 90
+    n_jobs = 5
+    # n_cycles = 6 # Don't need to specify this in the current version of the function, defaults to freqs/2
+    # Calculating multitaper PSD for each event is computationally too expensive, so let's average across all events for now:
+    event_array_mean = {event: np.mean(event_array[event], axis=0) for event in relevant_events}
+    # To use multitaper_analysis we need to add an extra dimension to the array:
+    for event in relevant_events:
+        event_array_mean[event] = np.expand_dims(event_array_mean[event], axis=0)
+    event_multitaper = {event: multitaper_analysis(event_array_mean[event], Fs, n_freqs, min_freq, max_freq, n_jobs) for event in relevant_events}
+    # Let's remove the extra dimension we added above:
+    for event in relevant_events:
+        event_multitaper[event] = np.squeeze(event_multitaper[event], axis=0)
+    if save_data == 'y':
+        outfile = os.path.join(montage_dir, f'{subj_prefix}_multitaper_psds_averaged.h5')
+        with h5py.File(outfile, 'w') as hf:
+            for event in relevant_events:
+                hf.create_dataset(event, data=event_multitaper[event])
+            hf.create_dataset('Channel Names', data=ch_names) # Add channel names as a separate dataset
+            if localization_completed:
+                hf.create_dataset('AAL Labels', data=aal_labels) # Add AAL labels as a separate dataset
+                hf.create_dataset('AAL Fuzzy Labels', data=fuzzy_labelsonly) # Add fuzzy labels as well
+                hf.create_dataset('MNI Coordinates', data=mni_coords)
+        print(f'\nMultitaper PSD array saved as:', outfile)
+        
+    # Let's repeat this but for the start/stop epochs in iSpy:
+    if task == 'iSpy':
+        ispy_multitaper = {}
+        # Loop through each stimulus and calculate multitaper PSD for each, and add to a dictionary labelled by stimulus:
+        for stimidx, stim in enumerate(startstop_XX):
+            # Skip trials that are shorter than 1 second in length (i.e. the ones that were cut off by the end of the recording):
+            if stim.shape[2] < Fs:
+                continue
+            print(f'\nCalculating multitaper PSD for stimulus {stimidx}...\n')
+            ispy_multitaper[f'iSpy_{stimidx}'] = multitaper_analysis(stim, Fs, n_freqs, min_freq, max_freq, n_jobs)
+        if save_data == 'y':
+            outfile = os.path.join(montage_dir, f'{subj_prefix}_startstop_multitaper_psds_averaged.h5')
+            with h5py.File(outfile, 'w') as hf:
+                for stim in ispy_multitaper:
+                    hf.create_dataset(stim, data=ispy_multitaper[stim])
+                # for stimidx, stim in enumerate(ispy_multitaper):
+                #     hf.create_dataset(f'iSpy_{stimidx}', data=ispy_multitaper[stimidx])
+                hf.create_dataset('Channel Names', data=ch_names)
+    
+        
+    # Next, calculate morlet PSD for each event and save to a single HDF5 file:
+    # n_freqs = 50
+    # min_freq = 5
+    # max_freq = 80
+    # n_cycles = 6
+    # event_morlet = {event: morlet_analysis(event_array[event], Fs, n_freqs, min_freq, max_freq, n_cycles) for event in relevant_events}
+    # if save_data == 'y':
+    #     outfile = os.path.join(subj_timepoint_processed_dir, f'{subj_prefix}_morlet_psds.h5')
+    #     with h5py.File(outfile, 'w') as hf:
+    #         for event in relevant_events:
+    #             hf.create_dataset(event, data=event_morlet[event])
+    #     print(f'\nMorlet PSD array saved as:', outfile)
+    
+    # ARCHIVED CODE FOR GENERATING ML TIMESERIES:
+    # # Generate timeseries features for ML:
+    # if task == 'GoNogo' or task == 'GoNogo_py': # Key features we're looking at here is Nogo correct vs. Nogo incorrect
+    #     if montage == 'bipolar':
+    #         outfile = os.path.join(subj_timepoint_processed_dir, subj_prefix + f'nogoCorrect_nogoIncorrect_timeseries_start{start_epoch}_stop{stop_epoch}_bipolar.h5')
+    #     else:
+    #         outfile = os.path.join(subj_timepoint_processed_dir, subj_prefix + f'nogoCorrect_nogoIncorrect_timeseries_start{start_epoch}_stop{stop_epoch}.h5')
+    #     X_nogo_correct = epoch_data['Nogo Correct'].get_data()
+    #     X_nogo_incorrect = epoch_data['Nogo Incorrect'].get_data()
+    #     X_go_correct = epoch_data['Go Correct'].get_data()
+    #     X_go_incorrect = epoch_data['Go Incorrect'].get_data()
+    #     # Recall that X is a 3D array formatted as follows: [trials, contacts, timeseries]
+    #     # Now, trim each epoch to only include the user-specified start and stop times, and save to mlarray:
+    #     nogo_correct_mlarray = []
+    #     nogo_incorrect_mlarray = []
+    #     go_correct_mlarray = []
+    #     go_incorrect_mlarray = []
+    #     for epoch in range(X_nogo_correct.shape[0]):
+    #         X_tmp = X_nogo_correct[epoch, :, start:stop] # Get only data within user-specified range
+    #         nogo_correct_mlarray.append(X_tmp)
+    #     for epoch in range(X_nogo_incorrect.shape[0]):
+    #         X_tmp = X_nogo_incorrect[epoch, :, start:stop]
+    #         nogo_incorrect_mlarray.append(X_tmp)
+    #     for epoch in range(X_go_correct.shape[0]):
+    #         X_tmp = X_go_correct[epoch, :, start:stop]
+    #         go_correct_mlarray.append(X_tmp)
+    #     for epoch in range(X_go_incorrect.shape[0]):
+    #         X_tmp = X_go_incorrect[epoch, :, start:stop]
+    #         go_incorrect_mlarray.append(X_tmp)
+    #     ## ARCHIVE: for posterity:
+    #     #nogo_correct_mlarray = []
+    #     # nogo_incorrect_mlarray = []
+    #     # for ch in range(X_nogo_correct.shape[1]):
+    #     #     X_tmp = X_nogo_correct[:, ch, start:stop] # Get only data within user-specified range
+    #     #     nogo_correct_mlarray.append(X_tmp)
+    #     # nogo_correct_mlarray = np.asarray(nogo_correct_mlarray)
+    #     # for ch in range(X_nogo_incorrect.shape[1]):
+    #     #     X_tmp = X_nogo_incorrect[:, ch, start:stop] # Get only data within user-specified range
+    #     #     nogo_incorrect_mlarray.append(X_tmp)
+    #     # nogo_incorrect_mlarray = np.asarray(nogo_incorrect_mlarray)
+    #     if save_data == 'y':
+    #         with h5py.File(outfile, 'w') as hf:
+    #             hf.create_dataset('nogo_correct', data=nogo_correct_mlarray)
+    #             hf.create_dataset('nogo_incorrect', data=nogo_incorrect_mlarray)
+    #             hf.create_dataset('go_correct', data=go_correct_mlarray)
+    #             hf.create_dataset('go_incorrect', data=go_incorrect_mlarray)
+    #         print('\nTimeseries machine learning input arrays saved as:', outfile)
+            
+    
+    ######################################################################################################################################################################################################
+    
+    # ARCHIVED CODE FOR GENERATING ML PSDs and analysis:
+    
+            
+    # # Generate PSD features for ML and save to same HD5 file as above:
+    # if task == 'GoNogo' or task == 'GoNogo_py':
+    #     psd_delta_nogo_correct, psd_theta_nogo_correct, psd_alpha_nogo_correct, psd_beta_nogo_correct, psd_gamma_nogo_correct, psd_all_nogo_correct = calc_psd(nogo_correct_mlarray, Fs)
+    #     psd_delta_nogo_incorrect, psd_theta_nogo_incorrect, psd_alpha_nogo_incorrect, psd_beta_nogo_incorrect, psd_gamma_nogo_incorrect, psd_all_nogo_incorrect = calc_psd(nogo_incorrect_mlarray, Fs)
+        
+    #     if save_data == 'y':
+    #         with h5py.File(outfile, 'w') as hf:
+    #             hf.create_dataset('nogo_correct_psd', data=psd_all_nogo_correct)
+    #             hf.create_dataset('nogo_incorrect_psd', data=psd_all_nogo_incorrect)
+    #         print('\nPSD machine learning input arrays saved as:', outfile)
+        
+    # if task == 'GoNogo' or task == 'GoNogo_py':
+    #     psd_combined = np.concatenate((np.transpose(psd_all_nogo_incorrect, (2,1,0)), np.transpose(psd_all_nogo_correct, (2,1,0))), axis = 1)
+    #     psd_combined_labels = np.concatenate((np.zeros(psd_all_nogo_incorrect.shape[1]), np.ones(psd_all_nogo_correct.shape[1])))
+        
+    #     if analyze_data == 'y':
+    #         x = psd_combined.transpose(1,0,2)
+    #         y = psd_combined_labels
+    #         x_train, x_test, y_train, y_test = train_test_split(x, y, test_size=0.3, stratify=y, random_state=42)
+            
+    #         roc_dict = {}
+            
+    #         for i in range(psd_combined.shape[2]):
+    #             # x = x_train[:,:,i]
+    #             # x = np.delete(x, slice(66,193,1), 0)
+    #             # y = np.delete(psd_combined_labels, slice(66,193,1), 0)
+    #             scaler = StandardScaler().fit(x_train[:, :, i], y_train)
+                
+    #             x_train_scaled = scaler.transform(x_train[:, :, i])
+    #             model = LogisticRegression(random_state=0)
+    #             model.fit(x_train_scaled, y_train)
+    #             x_test_scaled = scaler.transform(x_test[:, :, i])
+                
+    #             y_hat = model.predict_proba(x_test_scaled)
+    #             y_pred = y_hat[:, 1] > 0.5
+    #             #print(roc_auc_score(y_test, y_hat[:, 1]))
+    #             #print(confusion_matrix(y_pred, y_test))
+    #             # if average_precision_score(y_test, y_hat[:, 1]) > 0.9:
+    #             #     print(ch_names[i])
+    #             if roc_auc_score(y_test, y_hat[:, 1]) > 0.60:
+    #                 # print(ch_names[i])
+    #                 # print(roc_auc_score(y_test, y_hat[:, 1]))
+    #                 # print(confusion_matrix(y_pred, y_test))
+    #                 roc_dict[ch_names[i]] = roc_curve(y_test, y_hat[:,1])
+            
+    #         # Plot ROC curves for each "significant" channel:
+    #         roc_graphpath = os.path.join(subj_timepoint_processed_dir,'channel_rocs')
+    #         if not os.path.exists(roc_graphpath):
+    #             os.makedirs(roc_graphpath)
+            
+    #         # Make multiplot of ROCs
+    #         if sqrt(len(roc_dict.keys())).is_integer():
+    #             nrows = int(sqrt(len(roc_dict.keys())))
+    #             ncols = int(sqrt(len(roc_dict.keys())))
+    #         else:
+    #             nrows = floor(sqrt(len(roc_dict.keys())))
+    #             ncols = floor(sqrt(len(roc_dict.keys()))) + 1
+    #             totalcells = nrows * ncols
+    #             while totalcells < len(roc_dict.keys()):
+    #                 if nrows < ncols:
+    #                     nrows = nrows + 1
+    #                 else:
+    #                     ncols = ncols + 1
+    #                 totalcells = nrows * ncols
+    #             nrows = int(nrows)
+    #             ncols = int(ncols)
+    #         fig, axs = plt.subplots(nrows, ncols, figsize=(15,15))
+    #         fig.text(0.5, 0.04, 'False Positive Rate', ha='center', fontsize=20)
+    #         fig.text(0.04, 0.5, 'True Positive Rate', va='center', rotation='vertical', fontsize=20)
+                
+    #         for chidx, ch in enumerate(roc_dict.keys()):
+    #             fpr = roc_dict[ch][0]
+    #             tpr = roc_dict[ch][1]
+    #             threshold = roc_dict[ch][2]
+    #             ch_auc = auc(fpr, tpr)
+    #             col = chidx%ncols
+    #             row = chidx//ncols
+    #             axs[row, col].plot(fpr, tpr, label = 'AUC = %0.2f' % ch_auc)
+    #             axs[row, col].legend(loc = 'lower right')
+    #             axs[row, col].title.set_text(ch)
+    #             axs[row, col].set_xlim([0, 1])
+    #             axs[row, col].set_ylim([0, 1])
+    #             axs[row,col].plot([(0,0),(1,1)], linestyle='dashed')
+    #         fig.savefig(os.path.join(roc_graphpath, 'roc_combined.png'))
+                
+    #         # Save individual ROC plots as well:
+    #         for chidx, ch in enumerate(roc_dict.keys()):
+    #             fpr = roc_dict[ch][0]
+    #             tpr = roc_dict[ch][1]
+    #             threshold = roc_dict[ch][2]
+    #             ch_auc = auc(fpr, tpr)
+    #             plt.plot(fpr, tpr, label = 'AUC = %0.2f' % ch_auc)
+    #             plt.legend(loc = 'lower right')
+    #             plt.xlim([0, 1])
+    #             plt.ylim([0, 1])
+    #             plt.ylabel('True Positive Rate')
+    #             plt.xlabel('False Positive Rate')
+    #             plt.title(ch)
+    #             plt.savefig(os.path.join(roc_graphpath, '%s.png' % ch))
+    #             plt.close()
+                
+        
+    
+
+#x = np.mean(np.transpose(psd_combined, (2,1,0)), axis = 0)
+
+
+
+
+        
+    #average precision score
+
+
+###########################################################################################################################
+
+# # Machine learning (TEST):
+# from sklearn.model_selection import train_test_split
+# import tensorflow as tf
+# nogo_correct_mlarray = np.transpose(nogo_correct_mlarray, (1,0,2))
+# nogo_incorrect_mlarray = np.transpose(nogo_incorrect_mlarray, (1,0,2))
+# ml_input = np.concatenate((nogo_correct_mlarray, nogo_incorrect_mlarray))
+# ml_labels = np.concatenate((np.ones(78), np.zeros(28)))
+# X_train, X_test, y_train, y_test = train_test_split(ml_input, ml_labels, test_size = 0.20, random_state = 42)
+
+# # Define EEGNet architecture
+# model = tf.keras.Sequential([
+#     tf.keras.layers.Conv2D(16, (1, 51), strides=(1, 1), padding='same', activation='relu', input_shape=(X_train.shape[1], X_train.shape[2], 1)),
+#     tf.keras.layers.BatchNormalization(),
+#     tf.keras.layers.DepthwiseConv2D((X_train.shape[1], 1), depth_multiplier=2, padding='valid', activation='relu'),
+#     tf.keras.layers.BatchNormalization(),
+#     tf.keras.layers.AveragePooling2D((1, 4)),
+#     tf.keras.layers.Dropout(0.25),
+#     tf.keras.layers.Flatten(),
+#     tf.keras.layers.Dense(2, activation='softmax')  # Binary classification
+# ])
+
+# # Compile the model
+# model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+
+# # Train the model
+# model.fit(np.expand_dims(X_train, axis=-1), y_train, epochs=10, batch_size=32, validation_split=0.1)
+
+# # Predict probabilities for the test set
+# y_pred_probs = model.predict(np.expand_dims(X_test, axis=-1))
+
+# # Calculate AUC
+# auc = roc_auc_score(y_test, y_pred_probs[:, 1])  # Use probabilities for the positive class
+
+        
+        
+        
+###################################################################################################
+
+# # Define triggers and compute results:
+    # correct_trig = trig_map.get('Correct')
+    # incorrect_trig = trig_map.get('Incorrect')
+    # if task == 'SetShifting_CLeS' or task == 'SetShifting_original':
+    #     if '_original' in trigdef:
+    #         shift_trig = [trig_map.get('ExtraDim'), trig_map.get('IntraDim')]
+    #         ns_trig = [trig_map.get('ColorRule'), trig_map.get('ShapeRule')]
+    #     else:
+    #         shift_trig = trig_map.get('Shift')
+    #         ns_trig = trig_map.get('NoShift')           
+    # elif task == 'GoNogo':    
+    #     go_trig = trig_map.get('Go')
+    #     nogo_trig = trig_map.get('Nogo')     
+    # elif task == 'iSpy':
+    #     btn_correct_trig = trig_map.get('Btn Correct')
+    #     btn_incorrect_trig = trig_map.get('Btn Incorrect')
+    #     vis_correct_trig = trig_map.get('Vis Correct')
+    #     vis_incorrect_trig = trig_map.get('Vis Incorrect')
+    #     vis_fixation_trig = trig_map.get('Vis Fixation')
+    #     vis_stim_on_trig = trig_map.get('Stim On')
+    #     vis_stim_off_trig = trig_map.get('Stim Off')
+    #     vis_stim_fixation_trig = trig_map.get('Stim Fixation')
+    # else:
+    #     print('\nTask not defined')
+
+######################################################################################################################################################################################################
+
+### Rough work:
+  
+# mne.time_frequency.tfr_morlet(epoch_data["Nogo Incorrect"], np.arange(1, 100, 2), 2)
+
+# psds, freqs = mne.time_frequency.psd_array_welch(x=nogo_incorrect_mlarray, sfreq=Fs, fmin=0, fmax=80)
+
+# n = 5
+# r = np.arange(n)
+# width = 0.5
+# plt.bar(r, psd_nogo_correct, color = 'g', label = 'Nogo Correct')
+# plt.bar(r + width , psd_nogo_incorrect, color = 'r', label = 'Nogo Incorrect')
+
+# plt.xlabel("Frquency Band")
+# plt.ylabel("Power")
+  
+# # plt.grid(linestyle='--')
+# plt.xticks(r + width/2,list(frequency_bands)[0:5])
+# plt.legend()
+
+# plt.show()
+
+# plt.imshow(tmp, origin='lower', cmap='jet', 
+#                             aspect='auto', interpolation='none',
+#                             norm=LogNorm(np.mean(tmp), vmax=0.75*np.amax(tmp)))
+
+
+# import statsmodels.api as sm
+# #x = np.mean(psd_combined, axis = 0)
+# x = psd_combined[10,:,:]
+# x = sm.add_constant(x)
+# y = psd_combined_labels
+# model = sm.Logit(y, x)
+# result = model.fit(method = 'newton')
+
+######################################################################################################################################################################################################
+# elif task == 'GoNogo_pySTIM':
+#         trimmed = False
+#         num_trigs = 6
+#         go_start_tidxs = []
+#         go_end_tidxs = []
+#         nogo_start_tidxs = []
+#         nogo_end_tidxs = []
+#         go_correct_tidxs = []
+#         go_incorrect_tidxs = []
+#         nogo_correct_tidxs = []
+#         nogo_incorrect_tidxs = []
+        
+#         class PortCodes(IntFlag):
+#             reset = 0
+#             intent = 1
+#             p2 = 2
+#             fixation = 4  # fixation cross (ISI)
+#             vigilance = 8  # if trial is a vigilance trial
+#             btn = 16  # button press
+#             go = 32  # go trial
+#             nogo = 64  # nogo trial
+#             inhibition = 128  # if trial is an inhibition trial
+#             all = 255
+        
+#         triple_255 = False
+        
+#         if trimmed == False:
+#             for trigidx, trig in enumerate(triggers): # Identify startpoint and trim upto that
+#                 # Startpoint is marked by three 255s in a row, followed by a non-255 value:
+#                 if trig == 255 and triggers[trigidx + 1] == 255 and triggers[trigidx + 2] == 255 and triggers[trigidx + 3] != 255:
+#                     print('\nStarting GoNogo_py task at:\n','Index: ' + str(trigidx + 3) + '\n', 'Timepoint: ' + str(times[trigidx + 3]) + '\n', 'Trigger value: ' + str(triggers[trigidx + 3]))
+#                     # Trim triggers and times to startpoint:
+#                     triggers = np.delete(triggers, range(trigidx))
+#                     times = np.delete(times, range(trigidx))
+#                     triple_255 = True
+#             trimmed = True
+        
+#         if triple_255 == False: # Simeon changed the way he marks the start of the task at one point, so we need to account for that:
+#             print() # PLACEHOLDER
+        
+#         # Loop through trimmed triggers and build lists of triggers/timepoints based on event of interest
+#         # Events of interset include: Go Start, Go End, Nogo Start, Nogo End, Go Correct, Go Incorrect, Nogo Correct, Nogo Incorrect
+#         # The following loop will generate a separate list of triggers/timepoints for each event of interest:
+#         for i, trig in enumerate(triggers):
+#             flags = list(PortCodes(int(trig))) # Convert trigger to binary flags
+#             for l in flags: # Loop through binary flags
+#                 if int(l) == 32: # 32 = Go
+#                     go_start_tidx = times[i] # Identify startpoint of Go trial
+#                     go_start_tidxs.append(go_start_tidx) # Append startpoint to list of Go startpoints
+#                     stop = False
+#                     for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+#                         flags2 = list(PortCodes(int(trig2)))
+#                         for m in flags2:
+#                             if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+#                                 go_end_tidx = times[i+1:][j]
+#                                 go_end_tidxs.append(go_end_tidx)
+#                                 stop = True
+#                                 break
+#                             elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+#                                 go_end_tidx = times[i+1:][j]
+#                                 go_end_tidxs.append(go_end_tidx)
+#                                 stop = True
+#                                 break
+#                         if stop == True: # If next trial has been found, break out of loop
+#                             break
+#                 elif int(l) == 64: # 64 = Nogo
+#                     nogo_start_tidx = times[i] # Identify startpoint of Nogo trial
+#                     nogo_start_tidxs.append(nogo_start_tidx) # Append startpoint to list of Nogo startpoints
+#                     stop = False
+#                     for j, trig2 in enumerate(triggers[i+1:]): # Loop through subsequent triggers
+#                         flags2 = list(PortCodes(int(trig2))) # Convert trigger to binary flags
+#                         for m in flags2: # Loop through binary flags
+#                             if int(m) == 32 or int(m) == 64: # Indicates start of next trial (32 = Go, 64 = Nogo)
+#                                 nogo_end_tidx = times[i+1:][j]
+#                                 nogo_end_tidxs.append(nogo_end_tidx)
+#                                 stop = True
+#                                 break
+#                             elif times[i+1:][j] == times[-1]: # In case last trial is "Go"
+#                                 nogo_end_tidx = times[i+1:][j]
+#                                 nogo_end_tidxs.append(nogo_end_tidx)
+#                                 stop = True
+#                                 break
+#                         if stop == True: # If next trial has been found, break out of loop
+#                             break
+        
+#         # Now let's loop through the start/end timepoints of Go trials and identify correct/incorrect trials:
+#         for z, (a, b) in enumerate(zip(go_start_tidxs, go_end_tidxs)):
+#             tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+#             tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+#             if 16 not in tmpvals: # 16 = Button press; if there is no button press, then it's an incorrect Go trial
+#                 for n, l in enumerate(tmpvals):
+#                     if l == 4:
+#                         go_incorrect_tidx = tmpidxs[n]
+#                         go_incorrect_tidxs.append(go_incorrect_tidx)
+#                         break
+#                     else:
+#                         continue
+#                     break
+#             else:
+#                 for n, l in enumerate(tmpvals):
+#                     flags = list(PortCodes(int(l)))
+#                     for m in flags:
+#                         if int(m) == 16: # 16 = Button press, which is correct in Go trials
+#                             go_correct_tidx = tmpidxs[n]
+#                             go_correct_tidxs.append(go_correct_tidx)
+#                             break
+#                         else:
+#                             continue
+#                         break
+#         # And then do the same for NoGo trials:
+#         for z, (a, b) in enumerate(zip(nogo_start_tidxs, nogo_end_tidxs)):
+#             tmpvals = trigs.loc[trigs['idx'].between(a,b)]['val'].values
+#             tmpidxs = trigs.loc[trigs['idx'].between(a,b)]['idx'].values
+#             if 16 in tmpvals: # 16 = Button press, which is incorrect in Nogo trials
+#                 for l, m in enumerate(tmpvals):
+#                     flags = list(PortCodes(int(m)))
+#                     for n in flags:
+#                         if int(n) == 16: 
+#                             nogo_incorrect_tidx = tmpidxs[l]
+#                             nogo_incorrect_tidxs.append(nogo_incorrect_tidx)
+#                         else:
+#                             continue
+#                         break
+#             else: # If there is no button press, then it's a correct Nogo trial
+#                 for l, m in enumerate(tmpvals):
+#                     flags = list(PortCodes(m))
+#                     for n in flags:
+#                         if int(n) == 4: # We mark the time index of the fixation cross as the timepoint of NoGo Correct
+#                             nogo_correct_tidx = tmpidxs[l]
+#                             nogo_correct_tidxs.append(nogo_correct_tidx)
+#                             break
+#                         else:
+#                             continue
+#                         break
+                    
+#         # Compile time indices and times:
+#         idx_df_dict = dict({'go_start_tidxs':go_start_tidxs, 'go_end_tidxs':go_end_tidxs,
+#                                'go_correct_tidxs':go_correct_tidxs, 'go_incorrect_tidxs':go_incorrect_tidxs,
+#                                'nogo_start_tidxs':nogo_start_tidxs, 'nogo_end_tidxs':nogo_end_tidxs,
+#                                'nogo_correct_tidxs':nogo_correct_tidxs, 'nogo_incorrect_tidxs':nogo_incorrect_tidxs})
+#         idx_df = pd.DataFrame.from_dict(idx_df_dict, orient='index')
+#         idx_df = idx_df.transpose()
+#         go_start_times = raw_data.times[go_start_tidxs]
+#         go_correct_times = raw_data.times[go_correct_tidxs]
+#         go_incorrect_times = raw_data.times[go_incorrect_tidxs]
+#         go_end_times = raw_data.times[go_end_tidxs]
+#         nogo_start_times = raw_data.times[nogo_start_tidxs]
+#         nogo_correct_times = raw_data.times[nogo_correct_tidxs]
+#         nogo_incorrect_times = raw_data.times[nogo_incorrect_tidxs]
+#         nogo_end_times = raw_data.times[nogo_end_tidxs]
+#         times_df_dict = dict({'go_start_times':go_start_times, 'go_correct_times':go_correct_times, 'go_incorrect_times':go_incorrect_times, 'go_end_times':go_end_times, 'nogo_start_times':nogo_start_times, 'nogo_correct_times':nogo_correct_times, 'nogo_incorrect_times':nogo_incorrect_times, 'nogo_end_times':nogo_end_times})
+#         times_df = pd.DataFrame.from_dict(times_df_dict, orient='index')
+#         times_df = times_df.transpose()
+        
+#         # Generate event array in MNE-compatible format:
+#         if len(go_start_tidxs) > len(nogo_start_tidxs):
+#             event_array = np.zeros((len(go_start_tidxs)*num_trigs,3))
+#         else:
+#             event_array = np.zeros((len(nogo_start_tidxs)*num_trigs,3))
+#         n = 0
+#         for ii in [go_start_tidxs, go_correct_tidxs, go_incorrect_tidxs, go_end_tidxs, nogo_start_tidxs, nogo_correct_tidxs, nogo_incorrect_tidxs, nogo_end_tidxs]:
+#             for jj in ii:
+#                 if ii == go_start_tidxs:
+#                     event_array[n] = [jj, 0, 8]
+#                 elif ii == nogo_start_tidxs:
+#                     event_array[n] = [jj, 0, 16]
+#                 elif ii == go_correct_tidxs:
+#                     event_array[n] = [jj, 0, 2]
+#                 elif ii == nogo_correct_tidxs:
+#                     event_array[n] = [jj, 0, 92]
+#                 elif ii == go_incorrect_tidxs:
+#                     event_array[n] = [jj, 0, 1]
+#                 elif ii == nogo_incorrect_tidxs:
+#                     event_array[n] = [jj, 0, 91]
+#                 elif ii == go_end_tidxs:
+#                     event_array[n] = [jj, 0, 99]
+#                 elif ii == nogo_end_tidxs:
+#                     event_array[n] = [jj, 0, 999]
+#                 n+=1
+#         event_array=event_array[~np.all(event_array==0,axis=1)]
+        
+#         # Generate event dictionary in MNE-compatible format:
+#         event_dict = {
+#             'Go Start': 8,
+#             'Go Correct': 2,
+#             'Go Incorrect': 1,
+#             'Go End': 99,
+#             'Nogo Start': 16,
+#             'Nogo Correct': 92,
+#             'Nogo Incorrect': 91,
+#             'Nogo End': 999
+#         }
+#         return idx_df, times_df, event_dict, event_array
+        
+#         # ADD FUNCTIONALITY TO ACCOUNT FOR VIGILANCE VS. INHIBITION TRIALS
+        
+#         print()   # PLACEHOLDER
